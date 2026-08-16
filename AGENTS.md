@@ -69,6 +69,11 @@ Keep the HTTP/OAuth/session/Dockerfile/CI identical in shape; only the backend c
 - Platform + edge-config PRs opened
 - Print one line: `CALDAV_READY` plus image tag, PR URLs, and any Julian blocker (Logto API resource / DNS / 1Password)
 
+## Known Pitfalls
+
+- Forgejo Actions can fail during `Set up job` with no step logs when an immutable action commit is no longer advertised by the Forgejo action mirror. Verify every pinned revision with `git ls-remote https://forge.oddie.app/{owner}/{repo}.git` before release; update the pin to an advertised immutable commit rather than retrying the workflow unchanged.
+- Forgejo Runner does not apply the `default: stable` input declared by `dtolnay/rust-toolchain` when expanding the composite action. Always pass `toolchain: stable` explicitly or the action exits with `'toolchain' is a required input`.
+
 ## Probed facts (2026-08-17, do not re-derive)
 
 - Stalwart DAV accepts Logto Bearer. No Basic/app-password fallback.
