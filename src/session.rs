@@ -18,8 +18,15 @@
 //!
 //! Both mitigations are applied together in `build_router`.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{Method, Request, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use futures::Stream;
 use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
 use rmcp::transport::streamable_http_server::session::{
@@ -27,6 +34,8 @@ use rmcp::transport::streamable_http_server::session::{
     local::{LocalSessionManager, LocalSessionManagerError, SessionTransport},
 };
 use tracing::warn;
+
+use crate::logto_oidc::AuthenticatedIdentity;
 
 /// Maximum number of concurrent MCP sessions the server will hold.
 ///
@@ -49,6 +58,128 @@ pub const MAX_SESSIONS: usize = 256;
 // and suppress the clippy lint that would suggest the nicer-named constructor.
 #[allow(clippy::duration_suboptimal_units)]
 pub const SESSION_KEEP_ALIVE: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Clone, Debug)]
+struct BoundIdentity {
+    user_id: String,
+    last_seen: Instant,
+}
+
+/// Associates every live MCP session id with the verified token subject that
+/// created it. The rmcp manager intentionally treats session ids as bearer
+/// capabilities; this additional boundary prevents a leaked id from being
+/// used with a different valid account token.
+#[derive(Clone, Debug, Default)]
+pub struct SessionIdentityBindings {
+    inner: Arc<RwLock<HashMap<String, BoundIdentity>>>,
+}
+
+impl SessionIdentityBindings {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn bind(&self, session_id: &str, user_id: &str) {
+        let mut bindings = match self.inner.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let now = Instant::now();
+        bindings.retain(|_, bound| now.duration_since(bound.last_seen) < SESSION_KEEP_ALIVE);
+        if bindings.len() >= MAX_SESSIONS
+            && let Some(oldest) = bindings
+                .iter()
+                .min_by_key(|(_, bound)| bound.last_seen)
+                .map(|(id, _)| id.clone())
+        {
+            bindings.remove(&oldest);
+        }
+        bindings.insert(
+            session_id.to_owned(),
+            BoundIdentity {
+                user_id: user_id.to_owned(),
+                last_seen: now,
+            },
+        );
+    }
+
+    fn authorize(&self, session_id: &str, user_id: &str) -> bool {
+        let mut bindings = match self.inner.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let now = Instant::now();
+        let Some(bound) = bindings.get_mut(session_id) else {
+            drop(bindings);
+            return false;
+        };
+        if now.duration_since(bound.last_seen) >= SESSION_KEEP_ALIVE {
+            bindings.remove(session_id);
+            drop(bindings);
+            return false;
+        }
+        if bound.user_id != user_id {
+            drop(bindings);
+            return false;
+        }
+        bound.last_seen = now;
+        drop(bindings);
+        true
+    }
+
+    fn remove(&self, session_id: &str) {
+        let mut bindings = match self.inner.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        bindings.remove(session_id);
+    }
+}
+
+/// Enforce session ownership after bearer authentication and before rmcp sees
+/// the request. A 404 is used for mismatches so session ids are not an account
+/// membership oracle.
+pub async fn bind_session_identity(
+    State(bindings): State<SessionIdentityBindings>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(identity) = request.extensions().get::<AuthenticatedIdentity>() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "authenticated request missing identity extension\n",
+        )
+            .into_response();
+    };
+    let user_id = identity.user_id.clone();
+    let requested_session = request
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let is_delete = request.method() == Method::DELETE;
+
+    if let Some(session_id) = requested_session.as_deref()
+        && !bindings.authorize(session_id, &user_id)
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let response = next.run(request).await;
+    if let Some(session_id) = requested_session {
+        if is_delete || response.status() == StatusCode::NOT_FOUND {
+            bindings.remove(&session_id);
+        }
+    } else if let Some(session_id) = response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+    {
+        bindings.bind(session_id, &user_id);
+    }
+    response
+}
 
 /// Build a `LocalSessionManager` with the tightened idle TTL.
 ///
@@ -216,5 +347,105 @@ impl SessionManager for CappedSessionManager {
         id: SessionId,
     ) -> Result<RestoreOutcome<Self::Transport>, Self::Error> {
         Ok(self.inner.restore_session(id).await?)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use axum::Router;
+    use axum::http::header::HeaderValue;
+    use axum::middleware;
+    use axum::routing::post;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    #[test]
+    fn session_is_available_only_to_its_verified_subject() {
+        let bindings = SessionIdentityBindings::new();
+        bindings.bind("session-1", "user-a");
+
+        assert!(bindings.authorize("session-1", "user-a"));
+        assert!(!bindings.authorize("session-1", "user-b"));
+        assert!(!bindings.authorize("unknown", "user-a"));
+    }
+
+    #[test]
+    fn removing_session_removes_identity_binding() {
+        let bindings = SessionIdentityBindings::new();
+        bindings.bind("session-1", "user-a");
+        bindings.remove("session-1");
+        assert!(!bindings.authorize("session-1", "user-a"));
+    }
+
+    #[tokio::test]
+    async fn middleware_binds_initialize_response_and_rejects_other_subject() {
+        let bindings = SessionIdentityBindings::new();
+        let app = Router::new()
+            .route(
+                "/mcp",
+                post(|| async {
+                    let mut response = StatusCode::OK.into_response();
+                    response
+                        .headers_mut()
+                        .insert("mcp-session-id", HeaderValue::from_static("session-1"));
+                    response
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                bindings,
+                bind_session_identity,
+            ));
+
+        let mut initialize = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .body(Body::empty())
+            .unwrap();
+        initialize.extensions_mut().insert(AuthenticatedIdentity {
+            user_id: "user-a".into(),
+            email: None,
+            name: None,
+            exp: None,
+        });
+        assert_eq!(
+            app.clone().oneshot(initialize).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let mut resumed = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("mcp-session-id", "session-1")
+            .body(Body::empty())
+            .unwrap();
+        resumed.extensions_mut().insert(AuthenticatedIdentity {
+            user_id: "user-a".into(),
+            email: None,
+            name: None,
+            exp: None,
+        });
+        assert_eq!(
+            app.clone().oneshot(resumed).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let mut stolen = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("mcp-session-id", "session-1")
+            .body(Body::empty())
+            .unwrap();
+        stolen.extensions_mut().insert(AuthenticatedIdentity {
+            user_id: "user-b".into(),
+            email: None,
+            name: None,
+            exp: None,
+        });
+        assert_eq!(
+            app.oneshot(stolen).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
     }
 }

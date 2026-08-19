@@ -19,6 +19,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use futures::StreamExt;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
@@ -32,13 +33,23 @@ use tracing::{debug, warn};
 #[allow(clippy::duration_suboptimal_units)]
 const MAX_CACHE_TTL: Duration = Duration::from_secs(60);
 
-/// Soft cap on the validation cache size; sweep expired entries on overflow.
-const CACHE_SOFT_CAP: usize = 256;
+/// Hard cap on the positive validation cache. This cache is only an
+/// optimisation, so the earliest-expiring entry can be evicted safely.
+const CACHE_CAP: usize = 256;
 
 /// JWKS cache lifetime. Refetched on unknown `kid` regardless (key rotation).
 /// `from_secs` not `from_hours`: the unit constructors are unstable on 1.93.
 #[allow(clippy::duration_suboptimal_units)]
 const JWKS_TTL: Duration = Duration::from_secs(3600);
+
+/// Unknown key ids may indicate a key rotation, but must not turn arbitrary
+/// bearer strings into one outbound JWKS request each. At most one unknown
+/// key-triggered refresh is allowed in this interval.
+#[allow(clippy::duration_suboptimal_units)]
+const UNKNOWN_KID_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Bound the untrusted response read from the configured identity provider.
+const MAX_JWKS_BYTES: usize = 1024 * 1024;
 
 /// Claims we read off a Logto access token. Logto always emits `sub`, `aud`,
 /// `iss`, `exp`, `iat`. `email`/`name`/`username` are present only when the
@@ -98,6 +109,10 @@ pub enum ValidationError {
     Http(#[from] reqwest::Error),
     #[error("JWKS endpoint returned non-2xx: {status}")]
     JwksUpstream { status: u16 },
+    #[error("JWKS response exceeded {MAX_JWKS_BYTES} bytes")]
+    JwksTooLarge,
+    #[error("JWKS response was not valid JSON: {0}")]
+    InvalidJwks(#[from] serde_json::Error),
 }
 
 #[derive(Clone)]
@@ -107,6 +122,7 @@ pub struct LogtoValidationClient {
     expected_audiences: Vec<String>,
     expected_issuer: String,
     jwks: Arc<RwLock<JwksCache>>,
+    jwks_refresh_gate: Arc<tokio::sync::Mutex<()>>,
     cache: Arc<RwLock<HashMap<[u8; 32], CacheEntry>>>,
 }
 
@@ -124,6 +140,13 @@ impl std::fmt::Debug for LogtoValidationClient {
 struct JwksCache {
     keys: HashMap<String, DecodingKey>,
     fetched_at: Option<Instant>,
+    last_refresh_attempt: Option<Instant>,
+}
+
+enum CachedKeyDecision {
+    Use(DecodingKey),
+    SkipRefresh,
+    Refresh,
 }
 
 #[derive(Clone)]
@@ -154,6 +177,7 @@ impl LogtoValidationClient {
             expected_audiences,
             expected_issuer: issuer,
             jwks: Arc::new(RwLock::new(JwksCache::default())),
+            jwks_refresh_gate: Arc::new(tokio::sync::Mutex::new(())),
             cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
@@ -181,6 +205,21 @@ impl LogtoValidationClient {
             return Ok(None);
         };
 
+        // Reject attacker-controlled algorithm choices before any outbound
+        // key lookup. Otherwise a disallowed JWT can still trigger JWKS I/O.
+        if !matches!(
+            header.alg,
+            Algorithm::ES384
+                | Algorithm::ES256
+                | Algorithm::RS256
+                | Algorithm::RS384
+                | Algorithm::RS512
+                | Algorithm::EdDSA
+        ) {
+            warn!(alg = ?header.alg, "unsupported token signing algorithm; rejecting");
+            return Ok(None);
+        }
+
         let Some(decoding_key) = self.decoding_key_for(&kid).await? else {
             warn!(%kid, "no JWKS key matched token kid; rejecting");
             return Ok(None);
@@ -194,18 +233,6 @@ impl LogtoValidationClient {
         // already pinned by `kid` from the trusted JWKS and the signature is
         // verified against it below, and jsonwebtoken enforces key.family ==
         // alg.family, so a forged cross-family `alg` cannot validate.
-        if !matches!(
-            header.alg,
-            Algorithm::ES384
-                | Algorithm::ES256
-                | Algorithm::RS256
-                | Algorithm::RS384
-                | Algorithm::RS512
-                | Algorithm::EdDSA
-        ) {
-            warn!(alg = ?header.alg, "unsupported token signing algorithm; rejecting");
-            return Ok(None);
-        }
         let mut validation = Validation::new(header.alg);
         let audiences: Vec<&str> = self.expected_audiences.iter().map(String::as_str).collect();
         validation.set_audience(&audiences);
@@ -255,26 +282,68 @@ impl LogtoValidationClient {
     }
 
     async fn decoding_key_for(&self, kid: &str) -> Result<Option<DecodingKey>, ValidationError> {
-        // Fast path: cached key, JWKS still fresh.
-        if let Ok(g) = self.jwks.read() {
-            let fresh = g.fetched_at.is_some_and(|t| t.elapsed() < JWKS_TTL);
-            if fresh && let Some(k) = g.keys.get(kid) {
-                return Ok(Some(k.clone()));
-            }
+        match self.cached_key_decision(kid) {
+            CachedKeyDecision::Use(key) => return Ok(Some(key)),
+            CachedKeyDecision::SkipRefresh => return Ok(None),
+            CachedKeyDecision::Refresh => {}
         }
-        // Slow path: refetch JWKS (handles both stale cache and unknown kid).
+
+        // Single-flight the slow path, then re-check after waiting because a
+        // preceding request may already have refreshed the same key set.
+        let _refresh_guard = self.jwks_refresh_gate.lock().await;
+        match self.cached_key_decision(kid) {
+            CachedKeyDecision::Use(key) => return Ok(Some(key)),
+            CachedKeyDecision::SkipRefresh => return Ok(None),
+            CachedKeyDecision::Refresh => {}
+        }
         self.refresh_jwks().await?;
         Ok(self.jwks.read().ok().and_then(|g| g.keys.get(kid).cloned()))
     }
 
+    fn cached_key_decision(&self, kid: &str) -> CachedKeyDecision {
+        let Ok(g) = self.jwks.read() else {
+            return CachedKeyDecision::Refresh;
+        };
+        if let Some(key) = g.keys.get(kid)
+            && g.fetched_at.is_some_and(|t| t.elapsed() < JWKS_TTL)
+        {
+            return CachedKeyDecision::Use(key.clone());
+        }
+        if g.last_refresh_attempt
+            .is_some_and(|t| t.elapsed() < UNKNOWN_KID_REFRESH_INTERVAL)
+        {
+            CachedKeyDecision::SkipRefresh
+        } else {
+            CachedKeyDecision::Refresh
+        }
+    }
+
     async fn refresh_jwks(&self) -> Result<(), ValidationError> {
+        if let Ok(mut cache) = self.jwks.write() {
+            cache.last_refresh_attempt = Some(Instant::now());
+        }
         let resp = self.http.get(&self.jwks_url).send().await?;
         if !resp.status().is_success() {
             return Err(ValidationError::JwksUpstream {
                 status: resp.status().as_u16(),
             });
         }
-        let set: JwkSet = resp.json().await?;
+        if resp
+            .content_length()
+            .is_some_and(|length| length > MAX_JWKS_BYTES as u64)
+        {
+            return Err(ValidationError::JwksTooLarge);
+        }
+        let mut body = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if body.len().saturating_add(chunk.len()) > MAX_JWKS_BYTES {
+                return Err(ValidationError::JwksTooLarge);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let set: JwkSet = serde_json::from_slice(&body)?;
         let mut keys = HashMap::new();
         for jwk in &set.keys {
             if let Some(kid) = jwk.common.key_id.clone()
@@ -312,9 +381,17 @@ impl LogtoValidationClient {
         let Ok(mut guard) = self.cache.write() else {
             return;
         };
-        if guard.len() >= CACHE_SOFT_CAP {
+        if guard.len() >= CACHE_CAP {
             let now = Instant::now();
             guard.retain(|_, e| e.expires_at > now);
+        }
+        if guard.len() >= CACHE_CAP
+            && let Some(eviction_key) = guard
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(key, _)| *key)
+        {
+            guard.remove(&eviction_key);
         }
         guard.insert(key, entry);
     }
@@ -338,7 +415,17 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
+
+    fn unsigned_token(alg: &str, kid: &str) -> String {
+        let header = format!(r#"{{"alg":"{alg}","kid":"{kid}"}}"#);
+        format!("{}.e30.c2ln", URL_SAFE_NO_PAD.encode(header))
+    }
 
     #[test]
     fn aud_single_and_multi_membership() {
@@ -369,5 +456,126 @@ mod tests {
         .unwrap();
         // Not a JWT — decode_header fails, no network touched.
         assert!(c.validate_token("opaque-abc123").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn random_unknown_kids_cannot_amplify_jwks_requests() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/oidc/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "keys": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = LogtoValidationClient::new(
+            &format!("{}/oidc", server.uri()),
+            vec!["https://res".into()],
+        )
+        .unwrap();
+
+        assert!(
+            client
+                .validate_token(&unsigned_token("RS256", "random-one"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            client
+                .validate_token(&unsigned_token("RS256", "random-two"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn disallowed_algorithm_is_rejected_before_jwks_lookup() {
+        let server = MockServer::start().await;
+        let client = LogtoValidationClient::new(
+            &format!("{}/oidc", server.uri()),
+            vec!["https://res".into()],
+        )
+        .unwrap();
+        assert!(
+            client
+                .validate_token(&unsigned_token("HS256", "random"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_jwks_response_is_rejected() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/oidc/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; MAX_JWKS_BYTES + 1]))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = LogtoValidationClient::new(
+            &format!("{}/oidc", server.uri()),
+            vec!["https://res".into()],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            client.decoding_key_for("missing").await,
+            Err(ValidationError::JwksTooLarge)
+        ));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn failed_jwks_refresh_is_also_cooled_down() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/oidc/jwks"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = LogtoValidationClient::new(
+            &format!("{}/oidc", server.uri()),
+            vec!["https://res".into()],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            client.decoding_key_for("random-one").await,
+            Err(ValidationError::JwksUpstream { status: 503 })
+        ));
+        assert!(
+            client
+                .decoding_key_for("random-two")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        server.verify().await;
+    }
+
+    #[test]
+    fn positive_validation_cache_has_a_hard_cap() {
+        let client = LogtoValidationClient::new(
+            "https://login.example.test/oidc",
+            vec!["https://res".into()],
+        )
+        .unwrap();
+        let identity = AuthenticatedIdentity {
+            user_id: "user".into(),
+            email: None,
+            name: None,
+            exp: None,
+        };
+        for i in 0..=CACHE_CAP {
+            client.cache_insert(hash_token(&format!("token-{i}")), &identity, None);
+        }
+        assert_eq!(client.cache.read().unwrap().len(), CACHE_CAP);
     }
 }

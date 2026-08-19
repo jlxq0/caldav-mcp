@@ -19,7 +19,7 @@ prometheus = { version = "0.13", default-features = false }
 governor = "0.7"
 http = "1"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.6", features = ["limit", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # OpenTelemetry tracing export. Active only when OTEL_EXPORTER_OTLP_ENDPOINT

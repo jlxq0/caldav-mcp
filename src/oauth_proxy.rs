@@ -88,14 +88,17 @@ impl OAuthProxyState {
         }
     }
 
-    fn insert(&self, state: String, pending: Pending) {
-        if let Ok(mut g) = self.inner.pending.lock() {
-            if g.len() >= PENDING_CAP {
-                let now = Instant::now();
-                g.retain(|_, p| now.duration_since(p.created) < PENDING_TTL);
-            }
-            g.insert(state, pending);
+    fn insert(&self, state: String, pending: Pending) -> bool {
+        let Ok(mut g) = self.inner.pending.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        g.retain(|_, p| now.duration_since(p.created) < PENDING_TTL);
+        if g.len() >= PENDING_CAP {
+            return false;
         }
+        g.insert(state, pending);
+        true
     }
 
     fn take(&self, state: &str) -> Option<Pending> {
@@ -171,14 +174,20 @@ pub async fn authorize(State(st): State<OAuthProxyState>, RawQuery(q): RawQuery)
         .map(|(_, v)| v.clone());
 
     let proxy_state = random_state();
-    st.insert(
+    if !st.insert(
         proxy_state.clone(),
         Pending {
             client_redirect_uri,
             client_state,
             created: Instant::now(),
         },
-    );
+    ) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many pending authorization requests; try again later\n",
+        )
+            .into_response();
+    }
 
     let mut saw_state = false;
     for (k, v) in &mut pairs {
@@ -318,19 +327,48 @@ mod tests {
             vec!["https://claude.ai/cb".to_owned()],
             "https://r.test",
         );
-        st.insert(
+        assert!(st.insert(
             "abc".to_owned(),
             Pending {
                 client_redirect_uri: "https://claude.ai/cb".to_owned(),
                 client_state: Some("xyz".to_owned()),
                 created: Instant::now(),
             },
-        );
+        ));
         let p = st.take("abc").expect("present");
         assert_eq!(p.client_redirect_uri, "https://claude.ai/cb");
         assert_eq!(p.client_state.as_deref(), Some("xyz"));
         // consumed
         assert!(st.take("abc").is_none());
+    }
+
+    #[test]
+    fn pending_state_map_fails_closed_at_hard_cap() {
+        let st = OAuthProxyState::new(
+            "https://l.test/oidc",
+            "https://r.test",
+            vec!["https://claude.ai/cb".to_owned()],
+            "https://r.test",
+        );
+        for i in 0..PENDING_CAP {
+            assert!(st.insert(
+                format!("state-{i}"),
+                Pending {
+                    client_redirect_uri: "https://claude.ai/cb".to_owned(),
+                    client_state: None,
+                    created: Instant::now(),
+                },
+            ));
+        }
+        assert!(!st.insert(
+            "overflow".to_owned(),
+            Pending {
+                client_redirect_uri: "https://claude.ai/cb".to_owned(),
+                client_state: None,
+                created: Instant::now(),
+            },
+        ));
+        assert_eq!(st.inner.pending.lock().unwrap().len(), PENDING_CAP);
     }
 
     #[tokio::test]

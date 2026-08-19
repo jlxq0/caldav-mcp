@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
+use url::Url;
 
 use crate::oauth_redirect;
 
@@ -260,18 +261,39 @@ fn require_env(key: &str) -> Result<String> {
 }
 
 fn validate_url(url: &str, key: &str) -> Result<()> {
-    if !is_absolute_http_uri(url) {
-        anyhow::bail!("{key} must be an absolute http(s) URL, got: {url}");
-    }
+    parse_secure_http_url(url).with_context(|| {
+        format!(
+            "{key} must be an absolute HTTPS URL (HTTP is allowed only for loopback), got: {url}"
+        )
+    })?;
     Ok(())
 }
 
 /// RFC 8707 resource indicator: absolute http(s) URI. Rejects bare tokens
 /// such as `stalwart` that Logto answers with `invalid_target`.
 pub fn is_absolute_http_uri(url: &str) -> bool {
-    (url.starts_with("https://") || url.starts_with("http://"))
-        && url.len() > "https://".len()
-        && !url.chars().any(char::is_whitespace)
+    parse_secure_http_url(url).is_ok()
+}
+
+fn parse_secure_http_url(value: &str) -> Result<Url> {
+    let parsed = Url::parse(value).context("invalid URL")?;
+    let host = parsed.host_str().context("URL has no host")?;
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
+        anyhow::bail!("cleartext HTTP is only allowed for loopback hosts");
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        anyhow::bail!("URL must not contain user info, a query, or a fragment");
+    }
+    Ok(parsed)
 }
 
 fn parse_rate_limit(key: &str, default: u32) -> Result<u32> {
@@ -365,6 +387,21 @@ mod tests {
         assert!(!is_absolute_http_uri("caldav-mcp.kampong.social"));
         assert!(is_absolute_http_uri("https://caldav-mcp.kampong.social"));
         assert!(is_absolute_http_uri("https://dav.kampong.social"));
+    }
+
+    #[test]
+    fn rejects_cleartext_remote_and_prefix_only_urls() {
+        assert!(!is_absolute_http_uri("http://dav.example.test"));
+        assert!(!is_absolute_http_uri("https://"));
+        assert!(!is_absolute_http_uri("https://user@dav.example.test"));
+        assert!(!is_absolute_http_uri("https://dav.example.test?secret=x"));
+    }
+
+    #[test]
+    fn permits_cleartext_only_for_local_development() {
+        assert!(is_absolute_http_uri("http://localhost:3000"));
+        assert!(is_absolute_http_uri("http://127.0.0.1:3000"));
+        assert!(is_absolute_http_uri("http://[::1]:3000"));
     }
 
     #[test]

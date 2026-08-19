@@ -80,7 +80,7 @@ pub fn tool_call(
     // `resource` may be a raw, caller-supplied tool parameter (even on
     // validation-failure paths), so sanitise it before emission to stop an
     // attacker injecting newlines / fake `outcome=` fragments into logs.
-    let safe_resource: Option<&str> = resource.map(|r| if is_safe_id(r) { r } else { "<invalid>" });
+    let safe_resource = resource.map(sanitize_resource_id);
     info!(
         target: "caldav_mcp::audit",
         event = "tool_call",
@@ -104,6 +104,13 @@ fn is_safe_id(id: &str) -> bool {
         && id.chars().all(|c| {
             c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | ':' | '/' | '%')
         })
+}
+
+/// Convert a caller-supplied resource id into a value safe for structured
+/// logs and tracing spans.
+#[must_use]
+pub fn sanitize_resource_id(id: &str) -> &str {
+    if is_safe_id(id) { id } else { "<invalid>" }
 }
 
 /// Emit an `introspect` (token-validation) audit event from the auth path.
@@ -139,6 +146,7 @@ mod tests {
         assert!(!is_safe_id("has space"));
         assert!(!is_safe_id("inject\noutcome=ok"));
         assert!(!is_safe_id(""));
+        assert_eq!(sanitize_resource_id("inject\noutcome=ok"), "<invalid>");
     }
 
     #[test]

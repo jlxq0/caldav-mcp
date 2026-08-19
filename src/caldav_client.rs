@@ -4,7 +4,7 @@
 //! No Basic credentials, app passwords, refresh tokens, or calendar data are
 //! stored by this service.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,7 @@ use url::Url;
 
 #[allow(clippy::duration_suboptimal_units)]
 const DISCOVERY_TTL: Duration = Duration::from_secs(3600);
-const DISCOVERY_SOFT_CAP: usize = 256;
+const DISCOVERY_CAP: usize = 256;
 const MAX_REDIRECTS: usize = 4;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_WINDOW_DAYS: i64 = 366;
@@ -31,6 +31,7 @@ const MAX_DESCRIPTION_BYTES: usize = 256 * 1024;
 const MAX_LOCATION_BYTES: usize = 8 * 1024;
 const MAX_ATTENDEES: usize = 200;
 const MAX_RECURRENCE_RULE_BYTES: usize = 2048;
+const MAX_FREE_BUSY_CALENDARS: usize = 256;
 const DEFAULT_TIMEZONE: &str = "Asia/Singapore";
 
 #[derive(Debug, Error)]
@@ -415,8 +416,9 @@ impl CaldavClient {
             let path = format!("{}/", calendar_url.path());
             calendar_url.set_path(&path);
         }
+        let event_file_id = uid.strip_prefix("urn:uuid:").unwrap_or(&uid);
         let event_url = calendar_url
-            .join(&format!("{uid}.ics"))
+            .join(&format!("{event_file_id}.ics"))
             .map_err(|_| CaldavError::InvalidHref)?;
         self.ensure_same_origin(&event_url)?;
         let response = self
@@ -451,7 +453,7 @@ impl CaldavClient {
         etag: Option<&str>,
         patch: &EventPatch,
     ) -> Result<Event, CaldavError> {
-        let url = self.resolve_href(event_href)?;
+        let url = self.resolve_event_href(event_href)?;
         let current = self
             .dav_request(token, Method::GET, url.clone(), None, "text/calendar", &[])
             .await?;
@@ -507,9 +509,27 @@ impl CaldavClient {
         event_href: &str,
         etag: Option<&str>,
     ) -> Result<(), CaldavError> {
-        let url = self.resolve_href(event_href)?;
+        let url = self.resolve_event_href(event_href)?;
+        // A same-origin href is not enough evidence that DELETE targets an
+        // event: WebDAV DELETE on a collection can be recursive. Read and
+        // parse the target as a VEVENT before issuing the destructive method.
+        let current = self
+            .dav_request(token, Method::GET, url.clone(), None, "text/calendar", &[])
+            .await?;
+        match current.status {
+            StatusCode::NOT_FOUND => return Err(CaldavError::NotFound),
+            _ => Self::require_success(&current)?,
+        }
+        parse_ical_event(&current.body, event_href)?;
+        let effective_etag = etag.map(ToOwned::to_owned).or_else(|| {
+            current
+                .headers
+                .get(ETAG)
+                .and_then(|value| value.to_str().ok())
+                .map(ToOwned::to_owned)
+        });
         let mut headers = Vec::new();
-        if let Some(value) = etag {
+        if let Some(value) = effective_etag.as_deref() {
             headers.push(("If-Match", normalize_etag(value)));
         }
         let header_refs: Vec<(&str, &str)> = headers
@@ -544,8 +564,21 @@ impl CaldavClient {
         start: &str,
         end: &str,
     ) -> Result<Vec<BusyInterval>, CaldavError> {
-        let mut busy = Vec::new();
+        let mut seen = HashSet::new();
+        let mut unique_hrefs = Vec::new();
         for calendar_href in calendar_hrefs {
+            if seen.insert(calendar_href.as_str()) {
+                unique_hrefs.push(calendar_href);
+                if unique_hrefs.len() > MAX_FREE_BUSY_CALENDARS {
+                    return Err(CaldavError::InvalidInput(format!(
+                        "free_busy accepts at most {MAX_FREE_BUSY_CALENDARS} unique calendars"
+                    )));
+                }
+            }
+        }
+
+        let mut busy = Vec::new();
+        for calendar_href in unique_hrefs {
             let events = self.list_events(token, calendar_href, start, end).await?;
             for event in events {
                 if event.status.as_deref() == Some("CANCELLED")
@@ -682,6 +715,20 @@ impl CaldavClient {
         Ok(url)
     }
 
+    fn resolve_event_href(&self, href: &str) -> Result<Url, CaldavError> {
+        let url = self.resolve_href(href)?;
+        if url.query().is_some()
+            || url.path().ends_with('/')
+            || url
+                .path_segments()
+                .and_then(Iterator::last)
+                .is_none_or(str::is_empty)
+        {
+            return Err(CaldavError::InvalidHref);
+        }
+        Ok(url)
+    }
+
     fn ensure_same_origin(&self, url: &Url) -> Result<(), CaldavError> {
         if url.scheme() == self.base_url.scheme()
             && url.host_str() == self.base_url.host_str()
@@ -709,8 +756,16 @@ impl CaldavClient {
         let Ok(mut guard) = self.discoveries.write() else {
             return;
         };
-        if guard.len() >= DISCOVERY_SOFT_CAP {
+        if guard.len() >= DISCOVERY_CAP {
             guard.retain(|_, entry| entry.cached_at.elapsed() < DISCOVERY_TTL);
+        }
+        if guard.len() >= DISCOVERY_CAP
+            && let Some(oldest) = guard
+                .iter()
+                .max_by_key(|(_, entry)| entry.cached_at.elapsed())
+                .map(|(key, _)| *key)
+        {
+            guard.remove(&oldest);
         }
         guard.insert(
             key,
@@ -1466,7 +1521,7 @@ fn generate_uid() -> String {
 
     let mut bytes = [0_u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
-    format!("{}@caldav-mcp.kampong.social", hex::encode(bytes))
+    format!("urn:uuid:{}", hex::encode(bytes))
 }
 
 #[cfg(test)]
@@ -1587,6 +1642,27 @@ mod tests {
         assert_eq!(normalize_etag("W/\"abc\""), "W/\"abc\"");
     }
 
+    #[test]
+    fn generated_uid_has_no_deployment_specific_domain() {
+        let uid = generate_uid();
+        assert!(uid.starts_with("urn:uuid:"));
+        assert!(!uid.contains("kampong.social"));
+    }
+
+    #[test]
+    fn discovery_cache_has_a_hard_cap() {
+        let client = CaldavClient::new("https://dav.example.test", None).unwrap();
+        let discovery = Discovery {
+            principal_href: "/principals/u/".into(),
+            calendar_home_href: "/dav/cal/u/".into(),
+            display_name: None,
+        };
+        for i in 0..=DISCOVERY_CAP {
+            client.discovery_insert(hash_token(&format!("token-{i}")), &discovery);
+        }
+        assert_eq!(client.discoveries.read().unwrap().len(), DISCOVERY_CAP);
+    }
+
     #[tokio::test]
     async fn list_calendars_forwards_bearer_verbatim() {
         let server = MockServer::start().await;
@@ -1661,6 +1737,96 @@ mod tests {
 
         assert_eq!(event.start.as_deref(), Some("2026-08-18T01:00:00Z"));
         assert_eq!(event.etag.as_deref(), Some("\"new-tag\""));
+    }
+
+    #[tokio::test]
+    async fn delete_event_refuses_non_event_resource_before_delete() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dav/cal/u/not-an-event"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("collection listing"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = CaldavClient::new(&server.uri(), None).unwrap();
+
+        let result = client
+            .delete_event("token", "/dav/cal/u/not-an-event", None)
+            .await;
+
+        assert!(matches!(result, Err(CaldavError::InvalidInput(_))));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn delete_event_verifies_vevent_and_preserves_normal_delete() {
+        let server = MockServer::start().await;
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:one\r\nSUMMARY:Planning\r\nDTSTART:20260817T010000Z\r\nDTEND:20260817T020000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        Mock::given(method("GET"))
+            .and(path("/dav/cal/u/default/event"))
+            .and(header("authorization", "Bearer token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"current\"")
+                    .set_body_string(ics),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/dav/cal/u/default/event"))
+            .and(header("authorization", "Bearer token"))
+            .and(header("if-match", "\"current\""))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = CaldavClient::new(&server.uri(), None).unwrap();
+
+        client
+            .delete_event("token", "/dav/cal/u/default/event", None)
+            .await
+            .unwrap();
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn free_busy_deduplicates_calendar_hrefs() {
+        let server = MockServer::start().await;
+        let empty_multistatus = r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"/>"#;
+        Mock::given(method("REPORT"))
+            .and(path("/dav/cal/u/default/"))
+            .respond_with(ResponseTemplate::new(207).set_body_string(empty_multistatus))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = CaldavClient::new(&server.uri(), None).unwrap();
+        let hrefs = vec![
+            "/dav/cal/u/default/".to_owned(),
+            "/dav/cal/u/default/".to_owned(),
+        ];
+
+        let result = client
+            .free_busy("token", &hrefs, "2026-08-01", "2026-08-02")
+            .await
+            .unwrap();
+
+        assert!(result.is_empty());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn free_busy_rejects_too_many_unique_calendars_before_network() {
+        let client = CaldavClient::new("https://dav.example.test", None).unwrap();
+        let hrefs = (0..=MAX_FREE_BUSY_CALENDARS)
+            .map(|i| format!("/dav/cal/u/{i}/"))
+            .collect::<Vec<_>>();
+
+        let result = client
+            .free_busy("token", &hrefs, "2026-08-01", "2026-08-02")
+            .await;
+
+        assert!(matches!(result, Err(CaldavError::InvalidInput(_))));
     }
 
     #[tokio::test]

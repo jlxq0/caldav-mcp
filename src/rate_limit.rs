@@ -25,11 +25,10 @@
 //!
 //! ## Memory bound
 //!
-//! Buckets are retained for the lifetime of the process; map growth is
-//! bounded by the number of distinct bearer hashes + Logto subjects, which
-//! is small for caldav-mcp's threat model (single tenant today, dozens
-//! long-term). Token rotation may churn a handful of extra entries, but
-//! each bucket is only a few hundred bytes — no eviction needed.
+//! Each bucket map has a hard cardinality cap and removes entries that have
+//! been idle for an hour. If a map remains full of active identities, new
+//! identities fail closed instead of allocating more memory or evicting a
+//! live bucket that still carries rate-limit state.
 //!
 //! ## Quota knobs
 //!
@@ -42,7 +41,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
@@ -55,9 +54,21 @@ use governor::{Quota, RateLimiter};
 /// session pool (`session::MAX_SESSIONS`).
 pub const MAX_INITIALIZES_PER_IDENTITY: u32 = 8;
 
+const MAX_BUCKETS_PER_MAP: usize = 4096;
+#[allow(clippy::duration_suboptimal_units)]
+const BUCKET_IDLE_TTL: Duration = Duration::from_secs(3600);
+
 /// Limiter type alias — `governor`'s direct (non-keyed) variant; we
 /// build one per identity and hand it out keyed by bearer-hash or sub.
 type Bucket = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
+
+#[derive(Debug)]
+struct BucketEntry {
+    bucket: Arc<Bucket>,
+    last_seen: Instant,
+}
+
+type BucketMap = RwLock<HashMap<String, BucketEntry>>;
 
 /// What kind of MCP tool this call is. Drives which quota applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,10 +85,10 @@ pub struct RateLimited;
 pub struct Limiter {
     reads_per_min: NonZeroU32,
     writes_per_min: NonZeroU32,
-    bearer_read: RwLock<HashMap<String, Arc<Bucket>>>,
-    bearer_write: RwLock<HashMap<String, Arc<Bucket>>>,
-    sub_read: RwLock<HashMap<String, Arc<Bucket>>>,
-    sub_write: RwLock<HashMap<String, Arc<Bucket>>>,
+    bearer_read: BucketMap,
+    bearer_write: BucketMap,
+    sub_read: BucketMap,
+    sub_write: BucketMap,
 }
 
 impl Limiter {
@@ -108,12 +119,12 @@ impl Limiter {
             Category::Read => (&self.bearer_read, &self.sub_read, self.reads_per_min),
             Category::Write => (&self.bearer_write, &self.sub_write, self.writes_per_min),
         };
-        let bearer_bucket = get_or_insert(bearer_map, bearer_hash, quota);
+        let bearer_bucket = get_or_insert(bearer_map, bearer_hash, quota)?;
         if bearer_bucket.check().is_err() {
             return Err(RateLimited);
         }
         if let Some(s) = sub {
-            let sub_bucket = get_or_insert(sub_map, s, quota);
+            let sub_bucket = get_or_insert(sub_map, s, quota)?;
             if sub_bucket.check().is_err() {
                 return Err(RateLimited);
             }
@@ -123,41 +134,55 @@ impl Limiter {
 }
 
 fn get_or_insert(
-    map: &RwLock<HashMap<String, Arc<Bucket>>>,
+    map: &BucketMap,
     key: &str,
     quota: NonZeroU32,
-) -> Arc<Bucket> {
+) -> Result<Arc<Bucket>, RateLimited> {
     // `governor::Quota::per_minute(n)` translates to one token every
     // (60/n) seconds with a burst of `n`.
     get_or_insert_with_quota(map, key, Quota::per_minute(quota))
 }
 
 fn get_or_insert_with_quota(
-    map: &RwLock<HashMap<String, Arc<Bucket>>>,
+    map: &BucketMap,
     key: &str,
     quota: Quota,
-) -> Arc<Bucket> {
-    if let Ok(guard) = map.read()
-        && let Some(b) = guard.get(key)
-    {
-        return Arc::clone(b);
-    }
-    // Slow path: re-check under write lock to avoid double-insert under
-    // contention.
+) -> Result<Arc<Bucket>, RateLimited> {
+    get_or_insert_capped(map, key, quota, MAX_BUCKETS_PER_MAP, BUCKET_IDLE_TTL)
+}
+
+fn get_or_insert_capped(
+    map: &BucketMap,
+    key: &str,
+    quota: Quota,
+    cap: usize,
+    idle_ttl: Duration,
+) -> Result<Arc<Bucket>, RateLimited> {
     let mut guard = match map.write() {
         Ok(g) => g,
-        // RwLock poisoning is unrecoverable here. A poisoned lock means a
-        // panic happened while holding the lock — the safe thing is to
-        // fall through to "no rate-limiting for this caller right now"
-        // rather than panic again and tear down the server. Logged
-        // upstream via tracing in the call site if it ever fires.
+        // Preserve existing entries after a panic; capacity checks below
+        // still apply, so lock poisoning cannot disable rate limiting.
         Err(p) => p.into_inner(),
     };
-    Arc::clone(
-        guard
-            .entry(key.to_owned())
-            .or_insert_with(|| Arc::new(RateLimiter::direct(quota))),
-    )
+    let now = Instant::now();
+    if let Some(entry) = guard.get_mut(key) {
+        entry.last_seen = now;
+        return Ok(Arc::clone(&entry.bucket));
+    }
+    guard.retain(|_, entry| now.duration_since(entry.last_seen) < idle_ttl);
+    if guard.len() >= cap {
+        return Err(RateLimited);
+    }
+    let bucket = Arc::new(RateLimiter::direct(quota));
+    guard.insert(
+        key.to_owned(),
+        BucketEntry {
+            bucket: Arc::clone(&bucket),
+            last_seen: now,
+        },
+    );
+    drop(guard);
+    Ok(bucket)
 }
 
 /// Rate limiter dedicated to fresh MCP session creation (the
@@ -173,8 +198,8 @@ fn get_or_insert_with_quota(
 #[derive(Debug)]
 pub struct InitializeLimiter {
     quota: Quota,
-    bearer: RwLock<HashMap<String, Arc<Bucket>>>,
-    sub: RwLock<HashMap<String, Arc<Bucket>>>,
+    bearer: BucketMap,
+    sub: BucketMap,
 }
 
 impl InitializeLimiter {
@@ -199,12 +224,12 @@ impl InitializeLimiter {
 
     /// Check both per-bearer-hash and per-sub initialize buckets.
     pub fn check(&self, bearer_hash: &str, sub: Option<&str>) -> Result<(), RateLimited> {
-        let bearer_bucket = get_or_insert_with_quota(&self.bearer, bearer_hash, self.quota);
+        let bearer_bucket = get_or_insert_with_quota(&self.bearer, bearer_hash, self.quota)?;
         if bearer_bucket.check().is_err() {
             return Err(RateLimited);
         }
         if let Some(s) = sub {
-            let sub_bucket = get_or_insert_with_quota(&self.sub, s, self.quota);
+            let sub_bucket = get_or_insert_with_quota(&self.sub, s, self.quota)?;
             if sub_bucket.check().is_err() {
                 return Err(RateLimited);
             }
@@ -288,5 +313,15 @@ mod tests {
         assert!(l.check("h", None).is_err());
         // Different bearer → fresh bucket.
         l.check("h2", None).unwrap();
+    }
+
+    #[test]
+    fn bucket_map_fails_closed_at_hard_cap() {
+        let map = RwLock::new(HashMap::new());
+        let quota = Quota::per_minute(NonZeroU32::MIN);
+        get_or_insert_capped(&map, "one", quota, 2, Duration::from_secs(60)).unwrap();
+        get_or_insert_capped(&map, "two", quota, 2, Duration::from_secs(60)).unwrap();
+        assert!(get_or_insert_capped(&map, "three", quota, 2, Duration::from_secs(60)).is_err());
+        assert_eq!(map.read().unwrap().len(), 2);
     }
 }

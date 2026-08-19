@@ -56,3 +56,18 @@ cargo test --all-features --locked
 - Stalwart `requireAudience` may accept only one resource indicator. Set
   `CALDAV_MCP_STALWART_AUDIENCE` to the audience the DAV server actually
   accepts, and keep RFC 9728 `resource` as `{origin}/mcp`.
+- A cache “soft cap” that only removes expired entries is not a memory bound.
+  Use a hard cap; fail closed for security state and deterministically evict
+  only entries whose state is an optional cache optimisation.
+- Unknown JWT `kid` values are attacker-controlled. JWKS refreshes must be
+  single-flight, globally cooled down (including failed refreshes), and
+  preceded by the signing-algorithm allowlist.
+- `rmcp` buffers a full streamable-HTTP JSON-RPC body. Keep an explicit request
+  body limit outside the rmcp service and bind each MCP session id to the
+  verified token subject that created it.
+- A same-origin DAV href does not prove the target is an event. Before a
+  destructive method, reject collection-shaped paths and verify the resource
+  parses as a `VEVENT`.
+- A clean, previously verified lockfile can become vulnerable when RustSec
+  publishes a new advisory. Keep `cargo audit` in CI and use the narrowest
+  compatible transitive update when the patched release needs no API change.

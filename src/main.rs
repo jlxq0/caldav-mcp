@@ -31,7 +31,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::net::TcpListener;
-use tower_http::trace::TraceLayer;
+use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 use tracing::info;
 
 use crate::auth::{AccessToken, AuthState, bearer_auth};
@@ -41,6 +41,10 @@ use crate::logto_oidc::LogtoValidationClient;
 use crate::mcp::CaldavMcpService;
 use crate::oauth_metadata::{authorization_server_metadata, protected_resource_metadata, register};
 use crate::rate_limit::{InitializeLimiter, Limiter, MAX_INITIALIZES_PER_IDENTITY};
+
+/// rmcp collects a complete JSON-RPC body before decoding it, so the service
+/// boundary must cap the stream first. This is well above normal MCP payloads.
+const MAX_MCP_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -124,6 +128,7 @@ fn build_router(
         session::SESSION_KEEP_ALIVE,
         MAX_INITIALIZES_PER_IDENTITY,
     ));
+    let session_bindings = session::SessionIdentityBindings::new();
 
     let mcp_routes = Router::new()
         .nest_service("/mcp", mcp_service)
@@ -133,9 +138,14 @@ fn build_router(
             initialize_rate_limit,
         ))
         .layer(middleware::from_fn_with_state(
+            session_bindings,
+            session::bind_session_identity,
+        ))
+        .layer(middleware::from_fn_with_state(
             auth_state.clone(),
             bearer_auth,
         ))
+        .layer(RequestBodyLimitLayer::new(MAX_MCP_REQUEST_BYTES))
         .with_state(auth_state);
 
     Router::new()
@@ -340,5 +350,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn oversized_mcp_request_is_rejected_before_buffering() {
+        let response = router(test_config())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::CONTENT_LENGTH, MAX_MCP_REQUEST_BYTES + 1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
