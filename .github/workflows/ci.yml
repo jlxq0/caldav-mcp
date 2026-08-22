@@ -1,0 +1,168 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+  IMAGE: ghcr.io/jlxq0/caldav-mcp
+
+jobs:
+  quality:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --all-features --locked
+      - name: RustSec audit
+        run: |
+          [ -x ~/.cargo/bin/cargo-audit ] || cargo install --locked cargo-audit
+          cargo audit
+      - uses: EmbarkStudios/cargo-deny-action@6c8f9facfa5047ec02d8485b6bf52b587b7777d1
+        with: { command: check bans licenses sources }
+
+  container:
+    runs-on: ubuntu-22.04
+    needs: quality
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with: { persist-credentials: false }
+      - id: release
+        name: Resolve image metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          test -n "$base_version"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="$GITHUB_REF_NAME"
+            version="${GITHUB_REF_NAME#v}"
+            if [[ "$version" != "$base_version" && "$version" != "$base_version"-* ]]; then
+              echo "tag version $version does not match Cargo version $base_version" >&2
+              exit 1
+            fi
+            push=true
+            if [[ "$version" == *-* ]]; then
+              prerelease=true
+            else
+              prerelease=false
+            fi
+          else
+            tag="ci-${GITHUB_SHA::8}"
+            version="${base_version}-dev+${GITHUB_SHA::8}"
+            push=false
+            prerelease=false
+          fi
+          {
+            echo "base-version=$base_version"
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "push=$push"
+            echo "prerelease=$prerelease"
+            echo "created=$(git show -s --format=%cI HEAD)"
+            echo "tags<<EOF"
+            echo "${IMAGE}:${tag}"
+            if [[ "$push" == true && "$prerelease" == false ]]; then
+              echo "${IMAGE}:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - name: Log in to GHCR
+        if: steps.release.outputs.push == 'true'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ steps.release.outputs.push == 'true' }}
+          load: ${{ steps.release.outputs.push != 'true' }}
+          tags: ${{ steps.release.outputs.tags }}
+          build-args: |
+            BUILD_VERSION=${{ steps.release.outputs.version }}
+            BUILD_REVISION=${{ github.sha }}
+            BUILD_CREATED=${{ steps.release.outputs.created }}
+          provenance: ${{ steps.release.outputs.push == 'true' && 'mode=max' || 'false' }}
+          sbom: ${{ steps.release.outputs.push == 'true' }}
+      - name: Scan image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ steps.release.outputs.tag }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+      - name: Attest image provenance
+        if: steps.release.outputs.push == 'true'
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+      - name: Generate release SBOM
+        if: steps.release.outputs.push == 'true'
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+        with:
+          image: ${{ env.IMAGE }}:${{ steps.release.outputs.tag }}
+          format: spdx-json
+          output-file: caldav-mcp.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Attest SBOM and create release
+        if: steps.release.outputs.push == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sha256sum caldav-mcp.spdx.json > SHA256SUMS
+          awk -v version="${{ steps.release.outputs.base-version }}" \
+            '$0 ~ "^## " version " " { found=1; next } /^## / && found { exit } found' \
+            CHANGELOG.md > release-notes.md
+          release_flags=()
+          if [[ "${{ steps.release.outputs.prerelease }}" == true ]]; then
+            release_flags+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            caldav-mcp.spdx.json SHA256SUMS \
+            --verify-tag \
+            --title "caldav-mcp ${GITHUB_REF_NAME#v}" \
+            --notes-file release-notes.md \
+            "${release_flags[@]}"
+      - name: Attest SBOM provenance
+        if: steps.release.outputs.push == 'true'
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-path: caldav-mcp.spdx.json

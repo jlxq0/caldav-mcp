@@ -90,20 +90,34 @@ jobs:
           export BUILDKIT_HOST="tcp://${GW}:1234"
           echo "buildkitd at ${BUILDKIT_HOST}"
           CACHE_REF="forge.oddie.app/jlxq0/caldav-mcp:buildcache"
+          BASE_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          test -n "${BASE_VERSION}"
+          REVISION="${GITHUB_SHA}"
+          CREATED="$(git show -s --format=%cI HEAD)"
           IMPORT_CACHE_ARG=()
           EXPORT_CACHE_ARG=()
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             V="${GITHUB_REF#refs/tags/}"
-            TAGS="forge.oddie.app/jlxq0/caldav-mcp:${V},forge.oddie.app/jlxq0/caldav-mcp:latest"
+            VERSION="${V#v}"
+            if [[ "$VERSION" != "$BASE_VERSION" && "$VERSION" != "$BASE_VERSION"-* ]]; then
+              echo "tag version ${VERSION} does not match Cargo version ${BASE_VERSION}" >&2
+              exit 1
+            fi
+            TAGS="forge.oddie.app/jlxq0/caldav-mcp:${V}"
+            if [[ "$VERSION" != *-* ]]; then
+              TAGS="${TAGS},forge.oddie.app/jlxq0/caldav-mcp:latest"
+            fi
             PUSH=true
             IMPORT_CACHE_ARG=(--import-cache "type=registry,ref=${CACHE_REF}")
             EXPORT_CACHE_ARG=(--export-cache "type=registry,ref=${CACHE_REF},mode=max")
           elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            VERSION="${BASE_VERSION}-dev+${GITHUB_SHA::8}"
             TAGS="forge.oddie.app/jlxq0/caldav-mcp:ci-${GITHUB_SHA::8}"
             PUSH=false
             IMPORT_CACHE_ARG=(--import-cache "type=registry,ref=${CACHE_REF}")
             EXPORT_CACHE_ARG=(--export-cache "type=registry,ref=${CACHE_REF},mode=max")
           else
+            VERSION="${BASE_VERSION}-dev+${GITHUB_SHA::8}"
             TAGS="forge.oddie.app/jlxq0/caldav-mcp:ci-${GITHUB_SHA::8}"
             PUSH=false
           fi
@@ -111,6 +125,9 @@ jobs:
             --frontend dockerfile.v0 \
             --local context=. \
             --local dockerfile=. \
+            --opt "build-arg:BUILD_VERSION=${VERSION}" \
+            --opt "build-arg:BUILD_REVISION=${REVISION}" \
+            --opt "build-arg:BUILD_CREATED=${CREATED}" \
             "${IMPORT_CACHE_ARG[@]}" \
             "${EXPORT_CACHE_ARG[@]}" \
             --output "type=image,\"name=${TAGS}\",push=${PUSH}"
