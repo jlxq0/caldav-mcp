@@ -9,8 +9,9 @@
 //! ## Envelope-only rule
 //!
 //! Span **attributes** must carry envelope metadata only:
-//! - `tool`, `mxid`, `room_id`, `outcome`, `latency_ms`, `step`
-//! - `token_hash` (SHA-256 prefix, same as the Loki audit log)
+//! - `tool`, `outcome`, `latency_ms`, `step`
+//! - `user_hash`, `resource_hash`, and `token_hash` (domain-separated SHA-256
+//!   prefixes, matching the Loki audit log)
 //!
 //! Span attributes must NOT include message bodies, recovery keys,
 //! access tokens, room display names, or any other user-supplied

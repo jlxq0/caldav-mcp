@@ -58,13 +58,10 @@ pub async fn bearer_auth(
     let is_introspect_path = request.uri().path() == "/token/introspect";
     match state.logto.validate_token(&token).await {
         Ok(Some(identity)) => {
-            debug!(user_id = %identity.user_id, "authenticated request");
-            audit::introspect(
-                &token_hash,
-                outcome::ACTIVE,
-                started,
-                identity.email.as_deref(),
-            );
+            let identity_label = identity.email.as_deref().unwrap_or(&identity.user_id);
+            let user_hash = audit::identity_hash(identity_label);
+            debug!(%user_hash, "authenticated request");
+            audit::introspect(&token_hash, outcome::ACTIVE, started, Some(identity_label));
             if !is_introspect_path {
                 let client_ip = last_used::parse_client_ip(
                     request

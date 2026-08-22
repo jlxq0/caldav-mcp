@@ -6,10 +6,11 @@
 //!
 //! ## What is and isn't logged
 //!
-//! Envelope fields **are** logged: `event`, `user` (email/sub), `method`
-//! (MCP tool name), `resource` (calendar/event href when relevant), `outcome`,
-//! `latency_ms`, `result_count`, `error_class`, `token_hash` (16 hex chars of
-//! `sha256(bearer)`).
+//! Envelope fields **are** logged: `event`, `user_hash`, `method` (MCP tool
+//! name), `resource_hash`, `outcome`, `latency_ms`, `result_count`,
+//! `error_class`, and `token_hash`. Hashes are 16 hex chars of domain-separated
+//! SHA-256 input, useful for correlation without writing clear identities,
+//! DAV hrefs, or bearer tokens to shared logs.
 //!
 //! Content fields **are not** logged: summaries, descriptions, locations,
 //! attendees, iCalendar bodies, bearer tokens (only their hash prefix),
@@ -35,12 +36,30 @@ pub mod outcome {
     pub const RATE_LIMITED: &str = "rate_limited";
 }
 
-/// First 16 hex chars of `sha256(bearer)` — a stable pseudonymous token id
-/// for correlation without ever logging the token.
+/// First 16 hex chars of `sha256("token:" + bearer)` — a stable pseudonymous
+/// token id for correlation without ever logging the token.
 #[must_use]
 pub fn token_hash(token: &str) -> String {
+    short_hash("token", token)
+}
+
+/// Stable pseudonymous identity id for logs and traces.
+#[must_use]
+pub fn identity_hash(identity: &str) -> String {
+    short_hash("identity", identity)
+}
+
+/// Stable pseudonymous DAV resource id for logs and traces.
+#[must_use]
+pub fn resource_hash(resource: &str) -> String {
+    short_hash("resource", resource)
+}
+
+fn short_hash(domain: &str, value: &str) -> String {
     let mut h = Sha256::new();
-    h.update(token.as_bytes());
+    h.update(domain.as_bytes());
+    h.update(b":");
+    h.update(value.as_bytes());
     let digest = h.finalize();
     hex::encode(&digest[..8])
 }
@@ -80,13 +99,14 @@ pub fn tool_call(
     // `resource` may be a raw, caller-supplied tool parameter (even on
     // validation-failure paths), so sanitise it before emission to stop an
     // attacker injecting newlines / fake `outcome=` fragments into logs.
-    let safe_resource = resource.map(sanitize_resource_id);
+    let user_hash = (!user.is_empty()).then(|| identity_hash(user));
+    let resource_hash = resource.map(|value| resource_hash(sanitize_resource_id(value)));
     info!(
         target: "caldav_mcp::audit",
         event = "tool_call",
         method = tool,
-        user,
-        resource = safe_resource,
+        user_hash,
+        resource_hash,
         outcome,
         latency_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
         result_count,
@@ -116,11 +136,12 @@ pub fn sanitize_resource_id(id: &str) -> &str {
 /// Emit an `introspect` (token-validation) audit event from the auth path.
 pub fn introspect(token_hash: &str, outcome: &'static str, started: Instant, user: Option<&str>) {
     let elapsed = started.elapsed();
+    let user_hash = user.map(identity_hash);
     info!(
         target: "caldav_mcp::audit",
         event = "introspect",
         token_hash,
-        user,
+        user_hash,
         outcome,
         latency_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
     );
@@ -137,6 +158,17 @@ mod tests {
         let h = token_hash("any-bearer-string");
         assert_eq!(h.len(), 16);
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn log_identifiers_are_pseudonymous_and_domain_separated() {
+        let email = "alice.chen@kanjo.sg";
+        let identity = identity_hash(email);
+        let resource = resource_hash(email);
+        assert_eq!(identity.len(), 16);
+        assert_eq!(resource.len(), 16);
+        assert_ne!(identity, resource);
+        assert!(!identity.contains("alice"));
     }
 
     #[test]

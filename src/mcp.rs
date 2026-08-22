@@ -138,12 +138,15 @@ fn map_caldav_err(error: CaldavError) -> ErrorData {
 }
 
 fn make_tool_span(tool: &'static str, user: &str, resource: Option<&str>) -> Span {
-    let resource = resource.map_or("", audit::sanitize_resource_id);
+    let user_hash = (!user.is_empty()).then(|| audit::identity_hash(user));
+    let resource_hash = resource
+        .map(audit::sanitize_resource_id)
+        .map(audit::resource_hash);
     tracing::info_span!(
         "mcp.tool",
         tool,
-        user,
-        resource,
+        user_hash,
+        resource_hash,
         outcome = tracing::field::Empty,
         latency_ms = tracing::field::Empty,
     )
