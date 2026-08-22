@@ -71,3 +71,12 @@ cargo test --all-features --locked
 - A clean, previously verified lockfile can become vulnerable when RustSec
   publishes a new advisory. Keep `cargo audit` in CI and use the narrowest
   compatible transitive update when the patched release needs no API change.
+- A security-critical allowlist that is absent must fail visibly at startup;
+  silently turning it into an empty list makes every OAuth attempt fail later
+  with a misleading client error and hides operator misconfiguration.
+- Shared logs and traces are a data boundary. Emit domain-separated hashes for
+  identities and DAV hrefs; never write clear emails, calendar paths, event
+  content, session credentials, or bearer tokens to observability backends.
+- A dependency-clean Rust lockfile does not cover operating-system libraries in
+  the runtime image. Scan the final container and refresh its pinned base digest
+  when the distro has shipped a fixed package.

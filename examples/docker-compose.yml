@@ -1,0 +1,14 @@
+services:
+  caldav-mcp:
+    image: ghcr.io/jlxq0/caldav-mcp:<version>
+    env_file:
+      - ../.env
+    ports:
+      - "127.0.0.1:3000:3000"
+    read_only: true
+    user: "65532:65532"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
