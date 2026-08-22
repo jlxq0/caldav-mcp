@@ -80,3 +80,7 @@ cargo test --all-features --locked
 - A dependency-clean Rust lockfile does not cover operating-system libraries in
   the runtime image. Scan the final container and refresh its pinned base digest
   when the distro has shipped a fixed package.
+- New stable Rust releases can add deny-by-default Clippy findings that older
+  local toolchains do not report. Reproduce CI with its exact stable release;
+  for findings emitted by dependency macros, use the narrowest documented lint
+  allowance at the macro call site and explain why it is necessary.

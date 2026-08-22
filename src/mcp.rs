@@ -742,6 +742,10 @@ impl CaldavMcpService {
     }
 }
 
+// rmcp's macro emits an async trait method even though `get_info` itself has
+// no asynchronous work. Rust 1.98's `unused_async_trait_impl` lint sees the
+// generated method, so keep the narrowly scoped allowance on this impl.
+#[allow(clippy::unused_async_trait_impl)]
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for CaldavMcpService {
     fn get_info(&self) -> ServerInfo {
