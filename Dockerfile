@@ -8,6 +8,9 @@ ARG RUST_VERSION=1.93
 # Digest pinned to rust:1.93-bookworm (OCI index). Update via Renovate.
 FROM rust:${RUST_VERSION}-bookworm@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31 AS builder
 
+ARG BUILD_REVISION=unknown
+ENV CALDAV_MCP_BUILD_REVISION=${BUILD_REVISION}
+
 WORKDIR /build
 
 # Cache dependencies separately from source: copy manifest first, build a
@@ -24,7 +27,20 @@ RUN cargo build --release --locked
 
 # Distroless runtime: no shell, no apt. `cc` variant ships glibc + ca-certs,
 # which we need for HTTPS to Logto (JWKS) and Stalwart (CalDAV).
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:e2d29aec8061843706b7e484c444f78fafb05bfe47745505252b1769a05d14f1
+# linux/amd64 manifest, pinned independently of the multi-architecture index.
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9a5775272c79c226db4d6762d3b5a2caffb2b9a59dcbe5ce8dc8879c9c404115
+
+ARG BUILD_VERSION=0.1.1
+ARG BUILD_REVISION=unknown
+ARG BUILD_CREATED=unknown
+LABEL org.opencontainers.image.title="caldav-mcp" \
+      org.opencontainers.image.description="Streamable-HTTP MCP server for Stalwart CalDAV" \
+      org.opencontainers.image.url="https://github.com/jlxq0/caldav-mcp" \
+      org.opencontainers.image.source="https://github.com/jlxq0/caldav-mcp" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${BUILD_VERSION}" \
+      org.opencontainers.image.revision="${BUILD_REVISION}" \
+      org.opencontainers.image.created="${BUILD_CREATED}"
 
 WORKDIR /app
 COPY --from=builder /build/target/release/caldav-mcp /app/caldav-mcp
