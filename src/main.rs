@@ -22,14 +22,15 @@ mod token_introspect;
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Method, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
+use axum::{Json, Router};
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
+use serde::Serialize;
 use tokio::net::TcpListener;
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 use tracing::info;
@@ -45,6 +46,18 @@ use crate::rate_limit::{InitializeLimiter, Limiter, MAX_INITIALIZES_PER_IDENTITY
 /// rmcp collects a complete JSON-RPC body before decoding it, so the service
 /// boundary must cap the stream first. This is well above normal MCP payloads.
 const MAX_MCP_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+
+const BUILD_REVISION: &str = match option_env!("CALDAV_MCP_BUILD_REVISION") {
+    Some(revision) => revision,
+    None => "unknown",
+};
+
+#[derive(Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    version: &'static str,
+    revision: &'static str,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -181,7 +194,11 @@ fn build_router(
 }
 
 async fn health() -> impl IntoResponse {
-    (StatusCode::OK, "ok\n")
+    Json(HealthResponse {
+        status: "healthy",
+        version: env!("CARGO_PKG_VERSION"),
+        revision: BUILD_REVISION,
+    })
 }
 
 async fn initialize_rate_limit(
@@ -240,7 +257,7 @@ fn init_tracing() {
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
     let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("caldav_mcp=info,tower_http=info,axum=info,info"));
+        .unwrap_or_else(|_| EnvFilter::new("caldav_mcp=info,tower_http=info,axum=info,rmcp=warn"));
     let otel_layer = telemetry::try_build_otel_layer();
     let json_layer = std::env::var("CALDAV_MCP_LOG_FORMAT").as_deref() == Ok("json");
     let registry = tracing_subscriber::registry()
@@ -270,7 +287,7 @@ async fn shutdown_signal() {
 mod tests {
     use std::net::SocketAddr;
 
-    use axum::body::Body;
+    use axum::body::{Body, to_bytes};
     use axum::http::{Request, header};
     use tower::ServiceExt;
 
@@ -314,6 +331,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let health: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(health["status"], "healthy");
+        assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
+        assert!(health["revision"].is_string());
     }
 
     #[tokio::test]
