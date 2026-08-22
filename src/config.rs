@@ -313,13 +313,8 @@ fn parse_rate_limit(key: &str, default: u32) -> Result<u32> {
 }
 
 fn parse_redirect_uris_env() -> Result<Vec<String>> {
-    match std::env::var(oauth_redirect::ENV_OAUTH_REDIRECT_URIS) {
-        Ok(raw) => oauth_redirect::parse_allowlist(&raw, oauth_redirect::ENV_OAUTH_REDIRECT_URIS),
-        Err(std::env::VarError::NotPresent) => Ok(Vec::new()),
-        Err(e) => {
-            Err(e).with_context(|| format!("invalid {}", oauth_redirect::ENV_OAUTH_REDIRECT_URIS))
-        }
-    }
+    let raw = require_env(oauth_redirect::ENV_OAUTH_REDIRECT_URIS)?;
+    oauth_redirect::parse_allowlist(&raw, oauth_redirect::ENV_OAUTH_REDIRECT_URIS)
 }
 
 fn parse_trusted_proxy_hops() -> Result<usize> {
