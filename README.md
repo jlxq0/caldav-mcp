@@ -147,6 +147,21 @@ cargo audit
 cargo deny check bans licenses sources
 ```
 
+## Release and deployment
+
+Forge is canonical for source, tags, releases and the primary container image.
+Changes land on `main`; a signed `vX.Y.Z` tag runs the Forge CI release build
+and publishes `forge.oddie.app/jlxq0/caldav-mcp:vX.Y.Z`. The GitHub repository
+and GHCR image are mirrors.
+
+The maintained `kampong.social` beta and production deployments are defined in
+the separate Forge `oddie-apps/platform` GitOps repository. They pin immutable
+image digests, and ArgoCD reconciles those manifests to the cluster. A release
+is exercised on beta with the authenticated verification sequence in
+[the deployment guide](docs/deployment.md) before a separately reviewed
+production promotion. This service is stateless and has no database migration
+or seed step.
+
 Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Security
 issues must follow [SECURITY.md](SECURITY.md), not the public issue tracker.
 
