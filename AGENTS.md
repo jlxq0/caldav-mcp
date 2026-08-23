@@ -84,3 +84,7 @@ cargo test --all-features --locked
   local toolchains do not report. Reproduce CI with its exact stable release;
   for findings emitted by dependency macros, use the narrowest documented lint
   allowance at the macro call site and explain why it is necessary.
+- A Clippy lint introduced after the declared `rust-version` is itself unknown
+  to older supported compilers and fails under `-D warnings`. Put a scoped
+  `#[allow(unknown_lints)]` immediately before the version-specific allowance,
+  then verify strict Clippy on both the minimum and current stable toolchains.

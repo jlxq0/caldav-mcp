@@ -56,6 +56,7 @@ pub const MAX_SESSIONS: usize = 256;
 /// authenticated session flood.
 // `Duration::from_mins` is unstable on our MSRV (Rust 1.93); use `from_secs`
 // and suppress the clippy lint that would suggest the nicer-named constructor.
+#[allow(unknown_lints)]
 #[allow(clippy::duration_suboptimal_units)]
 pub const SESSION_KEEP_ALIVE: Duration = Duration::from_secs(30 * 60);
 

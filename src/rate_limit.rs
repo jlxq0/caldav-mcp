@@ -55,6 +55,7 @@ use governor::{Quota, RateLimiter};
 pub const MAX_INITIALIZES_PER_IDENTITY: u32 = 8;
 
 const MAX_BUCKETS_PER_MAP: usize = 4096;
+#[allow(unknown_lints)]
 #[allow(clippy::duration_suboptimal_units)]
 const BUCKET_IDLE_TTL: Duration = Duration::from_secs(3600);
 
@@ -239,6 +240,7 @@ impl InitializeLimiter {
 }
 
 #[cfg(test)]
+#[allow(unknown_lints)]
 #[allow(clippy::unwrap_used, clippy::duration_suboptimal_units)]
 mod tests {
     use super::*;

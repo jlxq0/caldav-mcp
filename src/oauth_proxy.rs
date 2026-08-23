@@ -35,6 +35,7 @@ use url::Url;
 use crate::oauth_redirect::is_allowed_redirect_uri;
 
 /// How long a pending authorization (client redirect/state mapping) lives.
+#[allow(unknown_lints)]
 #[allow(clippy::duration_suboptimal_units)] // `from_secs` is clearer than mins here
 const PENDING_TTL: Duration = Duration::from_secs(600);
 /// Soft cap on concurrent pending authorizations; sweep on overflow.

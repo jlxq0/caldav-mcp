@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
+#[allow(unknown_lints)]
 #[allow(clippy::duration_suboptimal_units)]
 const DISCOVERY_TTL: Duration = Duration::from_secs(3600);
 const DISCOVERY_CAP: usize = 256;
