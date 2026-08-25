@@ -108,13 +108,22 @@ jobs:
               TAGS="${TAGS},forge.oddie.app/jlxq0/caldav-mcp:latest"
             fi
             PUSH=true
+            # Import only. A tag build is the same commit as the `main` build
+            # that preceded it, so its cache would be byte-identical — and two
+            # concurrent writers to one ref is what fails a run whose image is
+            # already published. See the comment on the export below.
             IMPORT_CACHE_ARG=(--import-cache "type=registry,ref=${CACHE_REF}")
-            EXPORT_CACHE_ARG=(--export-cache "type=registry,ref=${CACHE_REF},mode=max")
           elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
             VERSION="${BASE_VERSION}-dev+${GITHUB_SHA::8}"
             TAGS="forge.oddie.app/jlxq0/caldav-mcp:ci-${GITHUB_SHA::8}"
             PUSH=false
             IMPORT_CACHE_ARG=(--import-cache "type=registry,ref=${CACHE_REF}")
+            # The only writer. Merging a PR and pushing the release tag are two
+            # pushes, so two `docker` jobs run at once; both exporting to one
+            # unqualified `:buildcache` ref made one of them lose the blob write
+            # and fail with `error writing layer blob: unknown` — after the
+            # image had already been pushed. One writer removes the race by
+            # construction rather than by scheduling.
             EXPORT_CACHE_ARG=(--export-cache "type=registry,ref=${CACHE_REF},mode=max")
           else
             VERSION="${BASE_VERSION}-dev+${GITHUB_SHA::8}"
