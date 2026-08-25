@@ -88,10 +88,16 @@ from the protected-resource response. For a JSON-based client:
 }
 ```
 
-The exact callback URI used by a client must appear in
+The callback URI used by a client must appear in
 `CALDAV_MCP_OAUTH_REDIRECT_URIS`. The provided example includes current Claude,
-Cowork, Cursor, Grok Bot and localhost callbacks. Remove clients you do not
+Cowork, Cursor, Grok Bot and loopback callbacks. Remove clients you do not
 intend to support.
+
+Entries match exactly, with one exception required by RFC 8252 §7.3: a loopback
+`http` entry such as `http://localhost:8787/callback` also matches the same
+scheme, host, path and query on **any** port, because a command-line client
+binds an ephemeral local port per session. The relaxation is the port alone;
+`https` and private-use-scheme entries keep exact matching, port included.
 
 ## Configuration
 
@@ -100,7 +106,7 @@ intend to support.
 | `CALDAV_MCP_RESOURCE_URL` | yes | — | Public HTTPS origin, without `/mcp`. |
 | `CALDAV_MCP_AUTHORIZATION_SERVER` | yes | — | Exact OIDC issuer URL. |
 | `CALDAV_MCP_STALWART_DAV_BASE_URL` | yes | — | Public Stalwart DAV origin. |
-| `CALDAV_MCP_OAUTH_REDIRECT_URIS` | yes | — | Comma-separated exact callback allowlist. Missing or empty configuration stops startup. |
+| `CALDAV_MCP_OAUTH_REDIRECT_URIS` | yes | — | Comma-separated callback allowlist, exact except that loopback `http` entries match any port. Missing or empty configuration stops startup. |
 | `CALDAV_MCP_DCR_CLIENT_ID` | no | disabled | Public PKCE client returned by the DCR compatibility endpoint. |
 | `CALDAV_MCP_STALWART_AUDIENCE` | no | resource origin | Absolute resource indicator forwarded during OAuth and accepted by Stalwart. |
 | `CALDAV_MCP_BIND_ADDR` | no | `0.0.0.0:3000` | Public HTTP listener behind TLS termination. |

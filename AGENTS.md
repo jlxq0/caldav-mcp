@@ -88,3 +88,10 @@ cargo test --all-features --locked
   to older supported compilers and fails under `-D warnings`. Put a scoped
   `#[allow(unknown_lints)]` immediately before the version-specific allowance,
   then verify strict Clippy on both the minimum and current stable toolchains.
+- An OAuth redirect allowlist matched by exact string equality cannot admit a
+  native or command-line client at all: RFC 8252 §7.3 clients bind an ephemeral
+  loopback port per session, so a fixed-port entry never matches and the
+  failure surfaces as `unregistered redirect_uri` from DCR rather than as a
+  server misconfiguration. Relax the port for loopback `http` entries only, and
+  keep scheme, host, path and query exact; a port relaxation applied to `https`
+  or private-use entries would admit a different origin.
