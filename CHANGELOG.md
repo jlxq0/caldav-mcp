@@ -3,7 +3,7 @@
 This project follows semantic versioning while it is pre-1.0. Release notes are
 also published with each signed source tag.
 
-## Unreleased
+## 0.1.2 - 2026-08-25
 
 ### Fixed
 
