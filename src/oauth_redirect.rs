@@ -248,6 +248,40 @@ mod tests {
         ));
     }
 
+    /// The relaxation reads the *requested* URI's scheme as well as the
+    /// entry's. Checking only the entry would let `https://localhost:3118/…`
+    /// match an `http://localhost:8787/…` entry — a different origin, and one
+    /// no client of ours ever asks for.
+    #[test]
+    fn loopback_entry_does_not_match_a_different_requested_scheme() {
+        let allowed = parse_allowlist("http://localhost:8787/callback", "TEST").unwrap();
+
+        assert!(!is_allowed_redirect_uri(
+            &allowed,
+            "https://localhost:3118/callback"
+        ));
+        assert!(!is_allowed_redirect_uri(
+            &allowed,
+            "https://localhost:8787/callback"
+        ));
+        assert!(!is_allowed_redirect_uri(
+            &allowed,
+            "cursor://localhost/callback"
+        ));
+
+        // And the other direction: an `https` loopback entry must not be
+        // downgraded to cleartext by a port-relaxed match.
+        let tls_loopback = parse_allowlist("https://localhost:8443/callback", "TEST").unwrap();
+        assert!(!is_allowed_redirect_uri(
+            &tls_loopback,
+            "http://localhost:3118/callback"
+        ));
+        assert!(!is_allowed_redirect_uri(
+            &tls_loopback,
+            "https://localhost:3118/callback"
+        ));
+    }
+
     /// A loopback entry must not become a wildcard for other loopback spellings
     /// or for cleartext hosts that merely look local.
     #[test]
