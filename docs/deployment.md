@@ -32,7 +32,10 @@ MCP clients require the RFC 7591 compatibility endpoint.
 
 The values in `CALDAV_MCP_OAUTH_REDIRECT_URIS` are the final MCP clients'
 callbacks, not caldav-mcp's callback. Keep that allowlist as narrow as your
-supported client set.
+supported client set. Matching is exact apart from the port of a loopback
+`http` entry, which RFC 8252 §7.3 requires the server to accept on any value —
+one `http://localhost:8787/callback` entry therefore covers every ephemeral
+port a command-line client picks.
 
 ## Stalwart
 
