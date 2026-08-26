@@ -130,6 +130,26 @@ impl LastUsedTracker {
 /// Returns `None` when the header is absent, has fewer entries than
 /// the trusted-hops count, or contains no parseable IP at the trusted
 /// position.
+/// How many entries the `X-Forwarded-For` chain actually carries.
+///
+/// The **count**, never the entries. `CALDAV_MCP_TRUSTED_PROXY_HOPS` has to
+/// equal the number of proxies that appended on the way in, and getting it
+/// wrong does not fail safe: too low selects an upstream proxy's address and
+/// records it as the client's, which is a confident wrong value in a
+/// provenance record rather than a missing one. Zero blanks the field
+/// entirely, which is recoverable.
+///
+/// Logging the count settles the value from one real request without putting
+/// a client address anywhere.
+#[must_use]
+pub fn count_xff_entries(xff: Option<&str>) -> usize {
+    xff.map_or(0, |raw| {
+        raw.split(',')
+            .filter(|part| !part.trim().is_empty())
+            .count()
+    })
+}
+
 #[must_use]
 pub fn parse_client_ip(xff: Option<&str>, trusted_proxy_hops: usize) -> Option<IpAddr> {
     let raw = xff?;
@@ -254,5 +274,23 @@ mod tests {
         assert_eq!(parse_client_ip(Some(""), 1), None);
         assert_eq!(parse_client_ip(Some("not an ip"), 1), None);
         assert_eq!(parse_client_ip(Some(", , ,"), 1), None);
+    }
+
+    /// The count is what makes the configured hop value checkable, so it has
+    /// to be the number of proxies that wrote an entry and not the number of
+    /// commas.
+    #[test]
+    fn xff_entries_are_counted_without_reading_them() {
+        assert_eq!(count_xff_entries(None), 0);
+        assert_eq!(count_xff_entries(Some("")), 0);
+        assert_eq!(count_xff_entries(Some("203.0.113.5")), 1);
+        assert_eq!(count_xff_entries(Some("203.0.113.5, 198.51.100.7")), 2);
+        // A trailing comma is not a proxy.
+        assert_eq!(count_xff_entries(Some("203.0.113.5, 198.51.100.7,")), 2);
+        // Nor is whitespace between them.
+        assert_eq!(
+            count_xff_entries(Some(" 203.0.113.5 ,  , 198.51.100.7 ")),
+            2
+        );
     }
 }

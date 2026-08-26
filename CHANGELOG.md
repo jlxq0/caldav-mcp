@@ -8,6 +8,13 @@ maintained, so their absence says nothing about whether a version shipped.
 
 ### Added
 
+- One log line per authenticated request carrying the **number** of
+  `X-Forwarded-For` entries the pod received and the configured
+  `CALDAV_MCP_TRUSTED_PROXY_HOPS`, never the entries themselves. Both
+  deployments set 0, which blanks the recorded client IP before the header is
+  read; a value that is too low is worse, selecting an upstream proxy's address
+  and recording it as the client's. The correct value is the entry count, and
+  these two fields settle it from one real request.
 - `caldav_mcp_initialize_admitted_total` and one log line per admitted
   `initialize` carrying the pseudonymous identity. 0.2.0 counted refusals only,
   which gives no rate and no baseline, so the counter added to investigate how

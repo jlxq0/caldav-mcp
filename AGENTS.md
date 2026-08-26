@@ -242,3 +242,11 @@ cargo test --all-features --locked
   can be observed from outside the MCP router. Per-identity counts go in the
   log line as `user_hash`, never as a metric label, where a hash is unbounded
   cardinality.
+- **A `pending` commit status on the `docker` context can mean it will never
+  run.** `docker` declares `needs: cargo`, so when `cargo` fails, `docker` is
+  never scheduled and its status stays `pending` indefinitely. No task appears
+  for it under `/actions/tasks` at all. That is indistinguishable from a job
+  queued behind the capacity-1 runner, and on 2026-08-26 it cost fifty minutes
+  of waiting for a job that could not start, out of a correct reluctance to
+  push and cancel an in-flight run. Before waiting on a `pending` status, check
+  whether a task for that sha exists and whether the job it depends on passed.
