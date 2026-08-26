@@ -66,9 +66,9 @@ pub enum CaldavError {
     /// refuses and names everyone it would have written to.
     #[error(
         "this event has attendees, so the write would send them calendar mail that cannot be \
-         recalled: {}. Stalwart decides which of these are actually mailed — an attendee hosted \
-         on it receives no message — and that is not visible from here. Pass \
-         send_scheduling_messages=true to proceed",
+         recalled: {}. Assume every one of them is written to — the only address Stalwart \
+         suppresses is the authenticated account's own. Pass send_scheduling_messages=true to \
+         proceed",
         .0.join(", ")
     )]
     SchedulingRefused(Vec<String>),
@@ -1229,10 +1229,12 @@ fn validate_exclusion_target(
 
 /// Every `ATTENDEE` in the object, master and overrides alike.
 ///
-/// Which of these the server actually writes to is its decision, not ours:
-/// Stalwart sends no iMIP for an attendee hosted on itself, and we cannot tell
-/// which domains those are. Naming too many is recoverable; naming too few
-/// puts mail in a stranger's inbox.
+/// All of them, and assume all of them are mailed. `send_update_messages()`
+/// skips only `email.is_local`, and `is_local` is exact membership of the
+/// *authenticated account's own* address set — its addresses and its groups'
+/// — not the domains the server hosts. Another mailbox on the same Stalwart is
+/// not local to this account and does receive an iMIP. Naming too many is
+/// recoverable; naming too few puts mail in a stranger's inbox.
 fn all_attendees(lines: &[String]) -> Vec<String> {
     let mut attendees = Vec::new();
     for line in lines {
