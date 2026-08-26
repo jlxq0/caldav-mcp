@@ -4,6 +4,47 @@ This project follows semantic versioning while it is pre-1.0. This file and the
 signed `vX.Y.Z` tags are the release record; Forgejo release objects are not
 maintained, so their absence says nothing about whether a version shipped.
 
+## 0.2.0 - 2026-08-26
+
+### Fixed
+
+- The `initialize` limiter refused correctly and reported nothing: no log line,
+  no `Retry-After`, no error class, and `tool_calls_total` reading zero because
+  the limiter sits in Axum middleware outside the MCP router. Eight failed
+  connection attempts left no server-side record of any kind.
+- Slots refill one at a time, so recovering from an exhausted allowance took
+  four hours rather than the thirty minutes the window length implies. A user
+  who waited out what they believed was the window received exactly one
+  session, reconnected twice and was refused again. The refill is now one slot
+  per minute, and the burst 24 rather than 8.
+
+### Added
+
+- `Retry-After` on the 429, taken from the bucket rather than re-derived from
+  the configured period, and rounded up.
+- A JSON error body with a stable class, so a client can distinguish too many
+  sessions from a rejected write, and which states that slots refill one at a
+  time.
+- `caldav_mcp_initialize_refusals_total{scope}`, and a warning log naming which
+  bucket refused and the pseudonymous identity it refused.
+- `CALDAV_MCP_INITIALIZE_BURST` and `CALDAV_MCP_INITIALIZE_REFILL_SECONDS`.
+- `get_event_raw`, returning a calendar object as stored with every `VEVENT`,
+  so a recurring series' `RRULE`, `EXDATE`s and `RDATE`s are reachable —
+  server-side expansion strips them, as RFC 4791 §9.6.5 requires.
+- `is_override`, `exdates`, `rdates`, and `RECURRENCE-ID` verbatim as
+  `recurrence_id_value`, `recurrence_id_tzid` and `recurrence_id_range` on
+  every event.
+
+### Fixed (calendar)
+
+- `update_event` patched and reported the first `VEVENT` in a calendar object.
+  For a recurring series whose override was stored first, it renamed a single
+  occurrence, reported success, and returned `recurrence_rule: null` for a
+  series that has one. It now selects the component with no `RECURRENCE-ID`.
+- `RECURRENCE-ID` was rendered to a UTC instant, which cannot build an
+  `EXDATE`; `RANGE=THISANDFUTURE` was dropped entirely, so a this-and-future
+  override was presented as a single-instance one.
+
 ## 0.1.2 - 2026-08-25
 
 ### Fixed
