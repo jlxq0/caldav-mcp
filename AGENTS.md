@@ -153,3 +153,12 @@ cargo test --all-features --locked
   `recurrence_id_range` verbatim. `RANGE=THISANDFUTURE` in particular means the
   override applies to that occurrence and every later one; dropping it, as the
   parser did, presents a this-and-future override as a single-instance one.
+- When breaking code to prove a test can fail, verify the *experiment* ran
+  before reading its result. Twice in one session a mutation reported "no test
+  died" for reasons that had nothing to do with the tests: a scripted
+  `str.replace` whose pattern no longer matched after `cargo fmt` reflowed the
+  line, and `cargo test --lib` on a crate with no library target, which exits
+  101 and prints no `test result:` line at all. Assert the pattern matched, and
+  treat a missing `test result:` line as a failed run rather than a clean one —
+  a mutation that never applied looks exactly like a test suite that caught
+  nothing.

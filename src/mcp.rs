@@ -315,6 +315,24 @@ struct UpdateEventParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GetEventRawParams {
+    /// Href of the calendar object, as returned in `href` by `list_events`.
+    /// Every component of a recurring series lives in this one resource.
+    event_href: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RawEventResult {
+    /// The calendar object exactly as stored.
+    ics: String,
+    etag: Option<String>,
+    /// Every `VEVENT` in the object: the master, then any overrides. Unlike
+    /// `list_events`, this is unexpanded, so the master carries its
+    /// `recurrence_rule`, `exdates` and `rdates`.
+    components: Vec<Event>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct DeleteEventParams {
     /// Event href returned by `list_events` or `search_events`.
     event_href: String,
@@ -629,6 +647,54 @@ impl CaldavMcpService {
             Some(&resource),
             started,
             result.is_ok().then_some(1),
+            &span,
+            &result,
+        );
+        result
+    }
+
+    #[tool(
+        description = "Fetch a calendar object exactly as stored, with its ETag and every VEVENT it contains. Use this to read a recurring series: list_events returns server-expanded instances, which RFC 4791 requires to have RRULE, EXDATE and RDATE stripped, so the master's recurrence properties are only visible here.",
+        annotations(title = "Get event raw", read_only_hint = true, idempotent_hint = true)
+    )]
+    async fn get_event_raw(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<GetEventRawParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let identity = identity_from_ctx(&ctx);
+        let user = user_label(identity.as_ref());
+        let resource = params.event_href.clone();
+        let span = make_tool_span("get_event_raw", &user, Some(&resource));
+        let (mut result, count) = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
+            let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
+            let (ics, etag, components) = self
+                .caldav
+                .get_event_raw(&token.0, &params.event_href)
+                .await
+                .map_err(map_caldav_err)?;
+            let count = components.len();
+            Ok::<_, ErrorData>((
+                structured_result(&RawEventResult {
+                    ics,
+                    etag,
+                    components,
+                }),
+                count,
+            ))
+        }
+        .instrument(span.clone())
+        .await
+        .unwrap_or_else(|error| (Err(error), 0));
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "get_event_raw",
+            &user,
+            Some(&resource),
+            started,
+            result.is_ok().then_some(count),
             &span,
             &result,
         );

@@ -110,6 +110,35 @@ pub struct Event {
     /// occurrence *and every later one*, and a caller that cannot see it
     /// treats a this-and-future override as a single-instance one.
     pub recurrence_id_range: Option<String>,
+    /// True when this component is an override rather than the master. `href`
+    /// is the master resource either way — every component of a series lives
+    /// in one calendar object — so there is no separate `master_href`: a
+    /// second field that can never differ from `href` is a second source that
+    /// can only agree.
+    pub is_override: bool,
+    /// `EXDATE` entries on this component, verbatim. Absent from expanded
+    /// instances, because RFC 4791 §9.6.5 requires the server to strip
+    /// recurrence properties when expanding; fetch the object unexpanded to
+    /// see them.
+    pub exdates: Vec<RecurrenceDate>,
+    /// `RDATE` entries on this component, verbatim. An `EXDATE` alone is
+    /// ambiguous when a series also carries `RDATE`s, so both are surfaced.
+    pub rdates: Vec<RecurrenceDate>,
+}
+
+/// One `EXDATE` or `RDATE` entry, kept in the form the server wrote it.
+///
+/// A rendered UTC instant is not interchangeable with this: an exclusion has
+/// to match the occurrence as the `RRULE` generates it, same value type and
+/// same `TZID`.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RecurrenceDate {
+    /// The value as written, e.g. `20260901T090000` or `20260901`.
+    pub value: String,
+    /// The `TZID` parameter, absent for UTC and floating values.
+    pub tzid: Option<String>,
+    /// True when the property carried `VALUE=DATE`, i.e. an all-day series.
+    pub is_date: bool,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -461,6 +490,35 @@ impl CaldavClient {
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned);
         Ok(parsed)
+    }
+
+    /// The calendar object exactly as stored, with its `ETag`.
+    ///
+    /// `list_events` reports expanded instances, and RFC 4791 §9.6.5 requires
+    /// a server to strip `RRULE`, `EXDATE` and `RDATE` when expanding, so the
+    /// master's recurrence properties are unreachable through it. This is the
+    /// unexpanded read those properties live in, and it is the same `GET`
+    /// `update_event` already performs before patching.
+    pub async fn get_event_raw(
+        &self,
+        token: &str,
+        event_href: &str,
+    ) -> Result<(String, Option<String>, Vec<Event>), CaldavError> {
+        let url = self.resolve_event_href(event_href)?;
+        let response = self
+            .dav_request(token, Method::GET, url, None, "text/calendar", &[])
+            .await?;
+        match response.status {
+            StatusCode::NOT_FOUND => return Err(CaldavError::NotFound),
+            _ => Self::require_success(&response)?,
+        }
+        let etag = response
+            .headers
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let components = parse_ical_events(&response.body, event_href)?;
+        Ok((response.body, etag, components))
     }
 
     pub async fn update_event(
@@ -938,6 +996,36 @@ fn parse_ical_event(ics: &str, href: &str) -> Result<Event, CaldavError> {
         .ok_or_else(|| CaldavError::InvalidInput("calendar object has no VEVENT".to_owned()))
 }
 
+/// `EXDATE`/`RDATE` entries, one per value: both properties may repeat and
+/// each may carry a comma-separated list, and the parameters belong to the
+/// property rather than to any one value.
+fn recurrence_dates(lines: &[String], name: &str) -> Vec<RecurrenceDate> {
+    let mut dates = Vec::new();
+    for line in lines {
+        let Some((head, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !property_name(head).eq_ignore_ascii_case(name) {
+            continue;
+        }
+        let tzid = parameter_value(head, "TZID").map(ToOwned::to_owned);
+        let is_date =
+            parameter_value(head, "VALUE").is_some_and(|value| value.eq_ignore_ascii_case("DATE"));
+        for entry in value
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            dates.push(RecurrenceDate {
+                value: entry.to_owned(),
+                tzid: tzid.clone(),
+                is_date: is_date || (entry.len() == 8 && !entry.contains('T')),
+            });
+        }
+    }
+    dates
+}
+
 fn event_from_lines(lines: &[String], href: String) -> Result<Event, CaldavError> {
     let direct_lines = direct_event_properties(lines);
     let lines = direct_lines.as_slice();
@@ -1004,6 +1092,9 @@ fn event_from_lines(lines: &[String], href: String) -> Result<Event, CaldavError
         recurrence_id_range: property("RECURRENCE-ID")
             .and_then(|(head, _)| parameter_value(head, "RANGE"))
             .map(str::to_uppercase),
+        is_override: property("RECURRENCE-ID").is_some(),
+        exdates: recurrence_dates(lines, "EXDATE"),
+        rdates: recurrence_dates(lines, "RDATE"),
     })
 }
 
@@ -2039,4 +2130,103 @@ mod tests {
         "DTEND;TZID=Asia/Singapore:20260801T100000\r\nRRULE:FREQ=WEEKLY\r\n",
         "END:VEVENT\r\nEND:VCALENDAR\r\n"
     );
+
+    /// `EXDATE` and `RDATE` may each repeat and each carry a comma-separated
+    /// list, and the parameters belong to the property rather than to any one
+    /// value. Flattening them without carrying `TZID` and `VALUE=DATE` down to
+    /// each entry would produce exclusions that match nothing.
+    #[test]
+    fn recurrence_dates_are_flattened_with_their_parameters() {
+        let lines = vec![
+            "EXDATE;TZID=Asia/Singapore:20260901T090000,20260908T090000".to_owned(),
+            "EXDATE;TZID=Asia/Singapore:20260915T090000".to_owned(),
+            "RDATE;VALUE=DATE:20261001".to_owned(),
+        ];
+        let exdates = recurrence_dates(&lines, "EXDATE");
+        assert_eq!(
+            exdates
+                .iter()
+                .map(|date| date.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["20260901T090000", "20260908T090000", "20260915T090000"]
+        );
+        assert!(
+            exdates
+                .iter()
+                .all(|date| date.tzid.as_deref() == Some("Asia/Singapore") && !date.is_date),
+            "TZID belongs to every value of the property that carried it"
+        );
+
+        let rdates = recurrence_dates(&lines, "RDATE");
+        assert_eq!(rdates.len(), 1);
+        assert!(rdates[0].is_date);
+        assert!(rdates[0].tzid.is_none());
+    }
+
+    /// A date-shaped value with no `VALUE=DATE` parameter is still a date.
+    /// Reporting it as a date-time would make an all-day exclusion match
+    /// nothing.
+    #[test]
+    fn a_bare_date_value_is_recognised_without_the_parameter() {
+        let lines = vec!["EXDATE:20260901".to_owned()];
+        let dates = recurrence_dates(&lines, "EXDATE");
+        assert_eq!(dates.len(), 1);
+        assert!(dates[0].is_date);
+    }
+
+    #[tokio::test]
+    async fn get_event_raw_returns_the_master_with_its_recurrence_properties() {
+        let server = MockServer::start().await;
+        let ics = concat!(
+            "BEGIN:VCALENDAR\r\n",
+            "BEGIN:VEVENT\r\nUID:series\r\nSUMMARY:Master\r\n",
+            "DTSTART;TZID=Asia/Singapore:20260801T090000\r\n",
+            "DTEND;TZID=Asia/Singapore:20260801T100000\r\n",
+            "RRULE:FREQ=WEEKLY\r\n",
+            "EXDATE;TZID=Asia/Singapore:20260815T090000\r\n",
+            "END:VEVENT\r\n",
+            "BEGIN:VEVENT\r\nUID:series\r\nSUMMARY:Moved\r\n",
+            "RECURRENCE-ID;TZID=Asia/Singapore:20260808T090000\r\n",
+            "DTSTART;TZID=Asia/Singapore:20260808T140000\r\n",
+            "DTEND;TZID=Asia/Singapore:20260808T150000\r\n",
+            "END:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+        Mock::given(method("GET"))
+            .and(path("/dav/cal/u/default/series.ics"))
+            .and(header("authorization", "Bearer token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_string(ics),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = CaldavClient::new(&server.uri(), None).unwrap();
+
+        let (body, etag, components) = client
+            .get_event_raw("token", "/dav/cal/u/default/series.ics")
+            .await
+            .unwrap();
+
+        assert_eq!(body, ics);
+        assert_eq!(etag.as_deref(), Some("\"v1\""));
+        assert_eq!(components.len(), 2);
+
+        let master = components.iter().find(|event| !event.is_override).unwrap();
+        assert_eq!(master.recurrence_rule.as_deref(), Some("FREQ=WEEKLY"));
+        assert_eq!(master.exdates.len(), 1);
+        assert_eq!(master.exdates[0].value, "20260815T090000");
+        assert_eq!(master.exdates[0].tzid.as_deref(), Some("Asia/Singapore"));
+
+        let moved = components.iter().find(|event| event.is_override).unwrap();
+        assert_eq!(
+            moved.recurrence_id_value.as_deref(),
+            Some("20260808T090000")
+        );
+        // The override's own start moved; the exclusion must key off the
+        // RECURRENCE-ID, not the start.
+        assert_ne!(moved.recurrence_id_value, moved.start);
+        server.verify().await;
+    }
 }
