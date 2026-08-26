@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, beta]
     tags: ["v*"]
   pull_request:
 
@@ -57,8 +57,14 @@ jobs:
     needs: cargo
     permissions: { contents: read, packages: write }
     steps:
+      # Full history and tags: `bin/ci-version` derives a beta version from the
+      # newest stable tag and the commits since it, and a shallow clone has
+      # neither.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-        with: { persist-credentials: false }
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          fetch-tags: true
       - name: Install buildctl
         env:
           BUILDKIT_VERSION: v0.30.0
@@ -78,7 +84,10 @@ jobs:
           mkdir -p ~/.docker
           F_AUTH=$(printf "%s:%s" "jlxq0" "${{ secrets.FORGE_PUSH_TOKEN }}" | base64 -w0)
           echo "{\"auths\":{\"forge.oddie.app\":{\"auth\":\"$F_AUTH\"}}}" > ~/.docker/config.json
-      - name: Build (and push on tag)
+      - name: Compute version
+        id: meta
+        run: bin/ci-version
+      - name: Build (and push on tag or beta)
         run: |
           set -euo pipefail
           # buildkitd runs on the runner host, listening on 0.0.0.0:1234. From
@@ -90,46 +99,57 @@ jobs:
           export BUILDKIT_HOST="tcp://${GW}:1234"
           echo "buildkitd at ${BUILDKIT_HOST}"
           CACHE_REF="forge.oddie.app/jlxq0/caldav-mcp:buildcache"
-          BASE_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
-          test -n "${BASE_VERSION}"
+          IMAGE="forge.oddie.app/jlxq0/caldav-mcp"
+          # Every version decision lives in bin/ci-version, including the guard
+          # that a release tag agrees with Cargo.toml. This step decides only
+          # which refs get pushed and who writes the cache.
+          VERSION="${{ steps.meta.outputs.version }}"
+          SHORT_SHA="${{ steps.meta.outputs.short_sha }}"
+          CHANNEL="${{ steps.meta.outputs.channel }}"
           REVISION="${GITHUB_SHA}"
           CREATED="$(git show -s --format=%cI HEAD)"
           IMPORT_CACHE_ARG=()
           EXPORT_CACHE_ARG=()
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            V="${GITHUB_REF#refs/tags/}"
-            VERSION="${V#v}"
-            if [[ "$VERSION" != "$BASE_VERSION" && "$VERSION" != "$BASE_VERSION"-* ]]; then
-              echo "tag version ${VERSION} does not match Cargo version ${BASE_VERSION}" >&2
-              exit 1
-            fi
-            TAGS="forge.oddie.app/jlxq0/caldav-mcp:${V}"
-            if [[ "$VERSION" != *-* ]]; then
-              TAGS="${TAGS},forge.oddie.app/jlxq0/caldav-mcp:latest"
-            fi
-            PUSH=true
-            # Import only. A tag build is the same commit as the `main` build
-            # that preceded it, so its cache would be byte-identical — and two
-            # concurrent writers to one ref is what fails a run whose image is
-            # already published. See the comment on the export below.
-            IMPORT_CACHE_ARG=(--import-cache "type=registry,ref=${CACHE_REF}")
-          elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
-            VERSION="${BASE_VERSION}-dev+${GITHUB_SHA::8}"
-            TAGS="forge.oddie.app/jlxq0/caldav-mcp:ci-${GITHUB_SHA::8}"
-            PUSH=false
-            IMPORT_CACHE_ARG=(--import-cache "type=registry,ref=${CACHE_REF}")
-            # The only writer. Merging a PR and pushing the release tag are two
-            # pushes, so two `docker` jobs run at once; both exporting to one
-            # unqualified `:buildcache` ref made one of them lose the blob write
-            # and fail with `error writing layer blob: unknown` — after the
-            # image had already been pushed. One writer removes the race by
-            # construction rather than by scheduling.
-            EXPORT_CACHE_ARG=(--export-cache "type=registry,ref=${CACHE_REF},mode=max")
-          else
-            VERSION="${BASE_VERSION}-dev+${GITHUB_SHA::8}"
-            TAGS="forge.oddie.app/jlxq0/caldav-mcp:ci-${GITHUB_SHA::8}"
-            PUSH=false
-          fi
+          case "$CHANNEL" in
+            release)
+              TAGS="${IMAGE}:v${VERSION}"
+              if [[ "$VERSION" != *-* ]]; then
+                TAGS="${TAGS},${IMAGE}:latest"
+              fi
+              PUSH=true
+              # Import only. A tag build is the same commit as the `main` build
+              # that preceded it, so its cache would be byte-identical — and two
+              # concurrent writers to one ref is what fails a run whose image is
+              # already published. See the comment on the export below.
+              IMPORT_CACHE_ARG=(--import-cache "type=registry,ref=${CACHE_REF}")
+              ;;
+            beta)
+              # No `latest`: the version always carries a `-beta.` suffix.
+              TAGS="${IMAGE}:v${VERSION},${IMAGE}:sha-${SHORT_SHA}"
+              PUSH=true
+              # Import only, for the same reason as a tag build: `beta` and
+              # `main` are pushed within seconds of each other often enough,
+              # and a second writer to one cache ref is what #8 removed. A
+              # partial cache hit when beta has diverged is the cheaper side.
+              IMPORT_CACHE_ARG=(--import-cache "type=registry,ref=${CACHE_REF}")
+              ;;
+            *)
+              TAGS="${IMAGE}:ci-${GITHUB_SHA::8}"
+              PUSH=false
+              if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+                IMPORT_CACHE_ARG=(--import-cache "type=registry,ref=${CACHE_REF}")
+                # The only writer. Merging a PR and pushing the release tag are
+                # two pushes, so two `docker` jobs run at once; both exporting
+                # to one unqualified `:buildcache` ref made one of them lose the
+                # blob write and fail with `error writing layer blob: unknown` —
+                # after the image had already been pushed. One writer removes
+                # the race by construction rather than by scheduling.
+                EXPORT_CACHE_ARG=(--export-cache "type=registry,ref=${CACHE_REF},mode=max")
+              fi
+              ;;
+          esac
+          echo "channel=${CHANNEL} version=${VERSION} push=${PUSH}"
+          echo "tags=${TAGS}"
           buildctl build \
             --frontend dockerfile.v0 \
             --local context=. \
