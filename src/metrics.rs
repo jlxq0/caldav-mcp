@@ -95,6 +95,17 @@ pub static INTROSPECT_LATENCY_SECONDS: LazyLock<HistogramVec> = LazyLock::new(||
     .expect("register introspect_latency_seconds once")
 });
 
+pub static INITIALIZE_REFUSALS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_with_registry!(
+        "caldav_mcp_initialize_refusals_total",
+        "MCP initialize requests refused by the per-identity session limiter. \
+         Labels: scope (bearer|subject|bucket_capacity).",
+        &["scope"],
+        prometheus::default_registry()
+    )
+    .expect("register initialize_refusals_total once")
+});
+
 /// Initialize all metrics. Idempotent — `LazyLock` ensures
 /// registration only happens once. Call this once at startup so the
 /// scraped `/metrics` text always lists the families even before
@@ -104,6 +115,7 @@ pub fn init() {
     LazyLock::force(&TOOL_LATENCY_SECONDS);
     LazyLock::force(&INTROSPECT_TOTAL);
     LazyLock::force(&INTROSPECT_LATENCY_SECONDS);
+    LazyLock::force(&INITIALIZE_REFUSALS_TOTAL);
 }
 
 /// Record a finished tool call.
@@ -112,6 +124,17 @@ pub fn record_tool_call(tool: &str, outcome: &str, elapsed: Duration) {
     TOOL_LATENCY_SECONDS
         .with_label_values(&[tool])
         .observe(elapsed.as_secs_f64());
+}
+
+/// Record an `initialize` refused by the session limiter.
+///
+/// The counter that did not exist. `tool_calls_total{outcome="rate_limited"}`
+/// reads zero during exactly this failure, because the limiter sits in Axum
+/// middleware outside the MCP router and a refusal never reaches the code that
+/// increments it — a metric measuring a limiter that was not firing while the
+/// one that was firing recorded nothing.
+pub fn record_initialize_refusal(scope: &str) {
+    INITIALIZE_REFUSALS_TOTAL.with_label_values(&[scope]).inc();
 }
 
 /// Record a finished introspection round-trip.
