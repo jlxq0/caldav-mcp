@@ -1,7 +1,8 @@
 # Changelog
 
-This project follows semantic versioning while it is pre-1.0. Release notes are
-also published with each signed source tag.
+This project follows semantic versioning while it is pre-1.0. This file and the
+signed `vX.Y.Z` tags are the release record; Forgejo release objects are not
+maintained, so their absence says nothing about whether a version shipped.
 
 ## 0.1.2 - 2026-08-25
 
@@ -35,6 +36,13 @@ also published with each signed source tag.
 - Add OCI metadata, public deployment examples and operator documentation.
 - Add GitHub CI, GHCR publication, SBOM, image scanning and signed build
   provenance.
+
+### Verified
+
+- Rust 1.98: formatting, strict Clippy, 96 tests, `cargo audit`, `cargo deny`,
+  a Linux/AMD64 image build, and zero HIGH or CRITICAL Trivy findings.
+- The exact release image passed authenticated public MCP/CalDAV CRUD and
+  free/busy acceptance, before and after production promotion.
 
 ## 0.1.0 - 2026-08-17
 

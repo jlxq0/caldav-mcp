@@ -118,3 +118,10 @@ cargo test --all-features --locked
   change it with nothing else going red. An unbracketed `"::1"` arm was
   unreachable for the same reason and was removed; in a security predicate an
   unreachable arm reads as coverage that is not there. Do not add it back.
+- `CHANGELOG.md` and the signed `vX.Y.Z` tags are this repo's release record.
+  Do not create Forgejo release objects: nothing downstream reads them (Renovate
+  tracks the container registry, ArgoCD reads the pinned digest, CI triggers on
+  the tag), and a releases page carrying some versions and not others answers
+  "did this ship?" with a confident no. Four of the seven Rust MCP servers have
+  never had one and the three that did stopped after their first, so the page is
+  maintained by nobody and read as if it were.
