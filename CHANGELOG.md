@@ -4,6 +4,18 @@ This project follows semantic versioning while it is pre-1.0. This file and the
 signed `vX.Y.Z` tags are the release record; Forgejo release objects are not
 maintained, so their absence says nothing about whether a version shipped.
 
+## 0.2.1 - 2026-08-26
+
+### Added
+
+- `caldav_mcp_initialize_admitted_total` and one log line per admitted
+  `initialize` carrying the pseudonymous identity. 0.2.0 counted refusals only,
+  which gives no rate and no baseline, so the counter added to investigate how
+  many sessions an identity opens could not answer it. The per-identity count
+  is in the log rather than in a metric label, where a hash would be unbounded
+  cardinality. It counts requests the limiter admitted, which is not the same
+  as sessions the MCP layer went on to create.
+
 ## 0.2.0 - 2026-08-26
 
 ### Fixed
