@@ -125,3 +125,19 @@ cargo test --all-features --locked
   "did this ship?" with a confident no. Four of the seven Rust MCP servers have
   never had one and the three that did stopped after their first, so the page is
   maintained by nobody and read as if it were.
+- The beta image version is derived by `bin/ci-version` from the newest stable
+  git tag plus the commits since it, and never from `Cargo.toml`. A manifest
+  carrying "the next version" between releases is a second source for a number
+  git already knows, and two sources for one fact disagree silently because
+  nothing compares them. `Cargo.toml` is read on a release tag only, where the
+  guard exists because `/health` reports `CARGO_PKG_VERSION` and a tag naming a
+  different number would be a lie the image cannot correct.
+- The prerelease suffix must be digits. The platform's
+  `clusters/fondue/*-beta/**` Renovate rule takes `-(beta|alpha)\.\d+$`, so a
+  sha suffix parses as valid semver, is accepted everywhere in this repo, and is
+  then unmatchable by the rule that maintains the deployment pin: no bump PR is
+  ever opened and beta silently stops moving. That is how `caldav-mcp-beta` ran
+  a pre-security-fix image for four days while reading Synced and Healthy.
+- A beta must sort above the release it replaces. `0.1.2-beta.<ts>` sorts below
+  `0.1.2`, so beta would read as older than production while running newer code;
+  `bin/ci-version` bumps the base first for that reason.

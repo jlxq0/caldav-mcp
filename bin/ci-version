@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Mints the version for one build. There are two rules and they never consult
+# each other:
+#
+#   refs/tags/v*      The tag is the version. It must agree with Cargo.toml,
+#                     because Cargo.toml is what the binary reports from
+#                     /health and a release tag naming a different number would
+#                     be a lie the image cannot correct.
+#
+#   refs/heads/beta   The version is derived from the newest stable tag, bumped
+#                     by the commits since it, plus a UTC timestamp. Cargo.toml
+#                     is NOT read. A manifest carrying "the next version"
+#                     between releases is a second source for a number git
+#                     already knows, and two sources for one fact can only ever
+#                     disagree — silently, because nothing compares them.
+#
+# The bumped base matters: a prerelease of a version that is already out sorts
+# BELOW it (0.1.2-beta.1 < 0.1.2), so beta would read as older than production
+# while running newer code. Any post-release artefact must sort after the stable
+# version it is intended to replace.
+#
+# Three version surfaces exist and only one of them is this script's output:
+# the image tag and its OCI label carry the artefact version computed here,
+# /health reports Cargo.toml's version (what the source says it is), and
+# /health's `revision` carries the git sha, which identifies the artefact
+# exactly and is the field to read when the other two disagree.
+
+VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z][0-9A-Za-z.-]*)?$'
+STABLE_TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+$'
+REF="${GITHUB_REF:-}"
+SHA="${GITHUB_SHA:-$(git rev-parse HEAD)}"
+SHORT_SHA="${SHA:0:7}"
+OUTPUT_LINES=()
+
+emit() {
+  OUTPUT_LINES+=("$1=$2")
+}
+
+flush_outputs() {
+  printf '%s\n' "${OUTPUT_LINES[@]}"
+  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+    printf '%s\n' "${OUTPUT_LINES[@]}" >> "$GITHUB_OUTPUT"
+  fi
+}
+
+cargo_version() {
+  local version
+  version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+  if [[ -z "$version" ]]; then
+    echo "::error::Could not read version from Cargo.toml" >&2
+    exit 1
+  fi
+  printf '%s\n' "$version"
+}
+
+bump_version() {
+  local base="$1" bump="$2" major minor patch
+  IFS=. read -r major minor patch <<< "$base"
+  case "$bump" in
+    major) major=$((major + 1)); minor=0; patch=0 ;;
+    minor) minor=$((minor + 1)); patch=0 ;;
+    patch) patch=$((patch + 1)) ;;
+    none) ;;
+    *) echo "::error::Unknown version bump: $bump" >&2; exit 1 ;;
+  esac
+  printf '%s.%s.%s\n' "$major" "$minor" "$patch"
+}
+
+bump_since() {
+  local base_tag="$1" subjects bodies
+  if [[ "$(git rev-list --count "${base_tag}..HEAD")" == "0" ]]; then
+    printf 'none\n'
+    return
+  fi
+  subjects="$(git log --format=%s "${base_tag}..HEAD")"
+  bodies="$(git log --format=%B "${base_tag}..HEAD")"
+  if grep -Eq '^[A-Za-z0-9_-]+(\([^)]+\))?!:' <<< "$subjects" ||
+     grep -Eq '(^|[[:space:]])BREAKING CHANGE:' <<< "$bodies"; then
+    printf 'major\n'
+  elif grep -Eq '^feat(\([^)]+\))?:' <<< "$subjects"; then
+    printf 'minor\n'
+  else
+    # A docs-or-chore-only beta is still a deployable artefact and still has to
+    # sort after the release it replaces, so the floor is patch and never none
+    # once there is any commit at all.
+    printf 'patch\n'
+  fi
+}
+
+if [[ "$REF" == refs/tags/v* ]]; then
+  VERSION="${REF#refs/tags/v}"
+  if [[ ! "$VERSION" =~ $VERSION_RE ]]; then
+    echo "::error::Invalid release tag: $REF" >&2
+    exit 1
+  fi
+  BASE_VERSION="$(cargo_version)"
+  if [[ "$VERSION" != "$BASE_VERSION" && "$VERSION" != "$BASE_VERSION"-* ]]; then
+    echo "::error::tag version ${VERSION} does not match Cargo version ${BASE_VERSION}" >&2
+    exit 1
+  fi
+  emit "channel" "release"
+elif [[ "$REF" == refs/heads/beta ]]; then
+  STABLE_TAGS="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | grep -E "$STABLE_TAG_RE" || true)"
+  BASE_TAG="${STABLE_TAGS%%$'\n'*}"
+  if [[ -z "$BASE_TAG" ]]; then
+    echo "::error::No stable release tag found; refusing to mint a prerelease with no base" >&2
+    exit 1
+  fi
+  BASE="${BASE_TAG#v}"
+  if [[ ! "$BASE" =~ $VERSION_RE ]]; then
+    echo "::error::Invalid stable release tag: $BASE_TAG" >&2
+    exit 1
+  fi
+  BUMP="$(bump_since "$BASE_TAG")"
+  NEXT_VERSION="$(bump_version "$BASE" "$BUMP")"
+  # Digits only, because the platform's clusters/fondue/*-beta Renovate rule
+  # takes `-(beta|alpha)\.\d+$`. A sha here parses as semver and is accepted by
+  # this repo, and then no bump PR is ever opened because the rule cannot match
+  # it — which is how caldav-mcp-beta sat on a pre-security-fix image.
+  VERSION="${NEXT_VERSION}-beta.${CI_BETA_TIMESTAMP:-$(date -u +%Y%m%d%H%M%S)}"
+  emit "base_tag" "$BASE_TAG"
+  emit "bump" "$BUMP"
+  emit "channel" "beta"
+else
+  VERSION="$(cargo_version)-dev+${SHORT_SHA}"
+  emit "channel" "dev"
+fi
+
+emit "version" "$VERSION"
+emit "short_sha" "$SHORT_SHA"
+flush_outputs
