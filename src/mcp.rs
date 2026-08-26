@@ -18,7 +18,7 @@ use tracing::{Instrument as _, Span};
 use crate::audit::{self, outcome};
 use crate::auth::AccessToken;
 use crate::caldav_client::{
-    BusyInterval, CaldavClient, CaldavError, Calendar, Event, EventPatch, NewEvent,
+    BusyInterval, CaldavClient, CaldavError, Calendar, Event, EventPatch, NewEvent, RecurrenceDate,
 };
 use crate::logto_oidc::{AuthenticatedIdentity, LogtoValidationClient};
 use crate::rate_limit::{Category, Limiter};
@@ -129,10 +129,15 @@ fn map_caldav_err(error: CaldavError) -> ErrorData {
             "Stalwart rejected the Logto bearer".to_owned(),
             None,
         ),
+        // `SchedulingRefused` names attendee addresses. That is safe to return
+        // to the caller — it is their own calendar — and it stays out of
+        // telemetry because `audit::error_class` records a static class rather
+        // than the message.
         CaldavError::InvalidHref
         | CaldavError::InvalidInput(_)
         | CaldavError::NotFound
-        | CaldavError::Conflict => ErrorData::invalid_params(error.to_string(), None),
+        | CaldavError::Conflict
+        | CaldavError::SchedulingRefused(_) => ErrorData::invalid_params(error.to_string(), None),
         other => ErrorData::internal_error(other.to_string(), None),
     }
 }
@@ -330,6 +335,42 @@ struct RawEventResult {
     /// `list_events`, this is unexpanded, so the master carries its
     /// `recurrence_rule`, `exdates` and `rdates`.
     components: Vec<Event>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct DeleteOccurrenceParams {
+    /// Href of the calendar object holding the whole series, as returned in
+    /// `href` by `list_events` or `get_event_raw`.
+    event_href: String,
+    /// The occurrence's **original** start, verbatim — `recurrence_id_value`
+    /// from `list_events`, or the value the `RRULE` generates. Never a moved
+    /// start and never a rendered UTC instant: an `EXDATE` that does not match
+    /// the generated occurrence exactly is accepted by the server and excludes
+    /// nothing.
+    recurrence_id: String,
+    /// `ETag` to guard the write with. Defaults to the one read immediately
+    /// before writing.
+    #[serde(default)]
+    etag: Option<String>,
+    /// Proceed even though the event has attendees, accepting that the server
+    /// will send them calendar mail that cannot be recalled. Defaults to
+    /// false, which refuses and names them.
+    #[serde(default)]
+    send_scheduling_messages: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DeleteOccurrenceResult {
+    event_href: String,
+    /// The `EXDATE` as written, with the value type and `TZID` taken from the
+    /// series' `DTSTART`.
+    exdate: RecurrenceDate,
+    /// True when the occurrence was already excluded, in which case nothing
+    /// was written.
+    already_excluded: bool,
+    /// True when an override for this occurrence was removed in the same
+    /// write.
+    removed_override: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -699,6 +740,61 @@ impl CaldavMcpService {
             Some(&resource),
             started,
             result.is_ok().then_some(count),
+            &span,
+            &result,
+        );
+        result
+    }
+
+    #[tool(
+        description = "Remove one occurrence from a recurring series: adds its EXDATE to the master component and deletes any override for it, in a single conditional PUT. The EXDATE's value type and TZID are taken from the series' DTSTART, so the exclusion matches what the RRULE generates. recurrence_id is trusted as given: this does not expand the RRULE to confirm the occurrence exists, so an unmatched value writes an EXDATE that excludes nothing. Refuses when the event has attendees, because the resulting calendar mail cannot be recalled and CalDAV offers no way to suppress it for this kind of write.",
+        annotations(
+            title = "Delete occurrence",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        )
+    )]
+    async fn delete_occurrence(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<DeleteOccurrenceParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let identity = identity_from_ctx(&ctx);
+        let user = user_label(identity.as_ref());
+        let resource = params.event_href.clone();
+        let span = make_tool_span("delete_occurrence", &user, Some(&resource));
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
+            let exclusion = self
+                .caldav
+                .delete_occurrence(
+                    &token.0,
+                    &params.event_href,
+                    &params.recurrence_id,
+                    params.etag.as_deref(),
+                    params.send_scheduling_messages,
+                )
+                .await
+                .map_err(map_caldav_err)?;
+            structured_result(&DeleteOccurrenceResult {
+                event_href: params.event_href,
+                exdate: exclusion.exdate,
+                already_excluded: exclusion.already_excluded,
+                removed_override: exclusion.removed_override,
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "delete_occurrence",
+            &user,
+            Some(&resource),
+            started,
+            result.is_ok().then_some(1),
             &span,
             &result,
         );

@@ -488,3 +488,79 @@ cargo test --all-features --locked
   `blocked` label makes a hold visible and does **not** route it, so a PR can
   sit correctly labelled and still be waiting on a question nobody has received.
   Two failures, two fixes: label it *and* name the owner.
+- There is no way to make a `PUT` quiet. Stalwart parses `Schedule-Reply: F`
+  (`crates/dav-proto/src/parser/header.rs`) but consults it only in
+  `crates/dav/src/calendar/delete.rs`; `update.rs` never reads it. Every
+  occurrence operation — adding an `EXDATE`, dropping an override, setting
+  `UNTIL` — is a `PUT`, so the header is accepted and ignored and the iTIP mail
+  goes out. The only per-attendee switch that works on `PUT` is
+  `SCHEDULE-AGENT=CLIENT`, which is persistent data that also silences every
+  later legitimate update. So a write that would schedule refuses by default
+  and names every `ATTENDEE`, and the caller opts in per call. Verified against
+  `v0.16.14` on 2026-08-26 and re-verified unchanged at `v0.16.19` on
+  2026-09-02 after the server was upgraded: `no_schedule_reply` is still read
+  in `delete.rs` and nowhere else, with `update.rs` and `copy_move.rs` at zero
+  occurrences.
+
+  **A version cited in a finding is a claim that expires when the deployment
+  moves**, and nothing reports the expiry. This one was written as "the
+  deployed image" and stopped being that overnight while still reading as
+  current. Cite the version *and* the date, and re-check at the running tag
+  before relying on it, which is `docker manifest inspect -v` against the pod's
+  `imageID` and then the same lines fetched at that tag rather than at `main`.
+- Assume every `ATTENDEE` is mailed. `send_update_messages()` skips an attendee
+  only when `email.is_local`, and `Email::new` sets that by exact membership of
+  `local_addresses` — which `build_account_info` fills with the **authenticated
+  account's own** addresses and its groups', each expanded across the domain's
+  names, not with the domains the server hosts. `is_local_domain()` exists and
+  is not what this uses. So a second mailbox on the same Stalwart is *not* local
+  to the acting account and does receive an iMIP; the only address suppressed is
+  the caller's own. Re-verified unchanged at `v0.16.19` on 2026-09-02:
+  `send_update_messages` still requires `!self.email.is_local` and `Email::new`
+  still sets it by exact membership. Read this before designing any experiment that puts an
+  `ATTENDEE` in a fixture: expecting no mail for a same-server attendee makes a
+  correct run look like a bug.
+- **Stalwart matches an `EXDATE` by instant, not by literal form.** Measured
+  2026-09-02 against the deployed server, one collection created and deleted for
+  the purpose (`#16`, `issuecomment-17026`): a UTC instant excludes an
+  occurrence of a zoned series, a date-time excludes one of an all-day series,
+  and an `EXDATE` for the series' **first** occurrence removes it. Two refusals
+  in `delete_occurrence` rested on the opposite and were removed rather than
+  kept as belt and braces, because each was justified by a claim the run
+  refuted. What still matters is the **instant**: `TZID=UTC:20260908T090000`
+  against a `TZID=Asia/Singapore` series excludes nothing, because 09:00 UTC is
+  a different moment.
+
+  **The exclusion is shaped to the caller's value rather than to `DTSTART`'s
+  parameters**, since a date under a `TZID=` head is malformed and no server can
+  repair that.
+
+  **And a wrong instant is still accepted with 201 and still does nothing**, so
+  the hazard is confirmed and only its cause was misdescribed. A value the
+  `RRULE` never generates is indistinguishable from a wrongly-zoned one, which
+  is why an expander is the only possible pre-flight check.
+
+  An `EXDATE` must still match the occurrence as the `RRULE` generates it: Take both from `DTSTART`
+  rather than from the caller — a mismatch is accepted by the server and
+  excludes nothing, which is a write that reports success and changes what the
+  calendar shows not at all. Remove the matching override in the same `PUT`, or
+  clients render an occurrence the series says does not exist.
+- **When a measurement changes what the server does, re-check every assumption
+  that rested on the old model, not only the ones you put on trial.** Learning
+  that Stalwart matches an `EXDATE` by **instant** retired two refusals I had
+  pre-registered. It also invalidated a third thing I had not questioned: the
+  idempotency check compared `EXDATE` **values** and ignored the zone, so
+  `EXDATE;TZID=UTC:20260908T090000` counted as already excluding the 09:00
+  Singapore occurrence. It does not, and the consequence was worse than a
+  redundant write: the exclusion was skipped, the override was still removed,
+  and the occurrence reappeared while the call reported success.
+
+  Found by cross-engine review of the change, asked as *can this new code do the
+  wrong thing in the case it was written for*. The same review found
+  `remove_override` stopping at the first match, so duplicate overrides left one
+  orphaned by the new `EXDATE` and a later read reported the occurrence the
+  deletion claimed to remove. **Accepting invalid input and preserving the
+  contradictory half of it is the wrong direction for a deletion tool.**
+
+  Both are the repair carrying a defect of the family it repaired, which is why
+  that question is asked of the diff and not of the code it fixes.
