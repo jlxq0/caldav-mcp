@@ -56,8 +56,16 @@ fn loopback_matches_ignoring_port(entry: &str, uri: &str) -> bool {
 /// Loopback hosts accepted for cleartext `http://` redirect URIs
 /// (RFC 8252 §7.3). Anything else over `http` would put the authorization
 /// code on the wire in cleartext.
+///
+/// Both call sites pass `Url::host_str()`, so what arrives here is already
+/// normalised by the `url` crate: `127.1`, `0177.0.0.1` and `2130706433` all
+/// arrive as `127.0.0.1`, and an IPv6 host always arrives bracketed. An
+/// unbracketed `"::1"` arm therefore cannot be reached and is not listed —
+/// in a security predicate an unreachable arm reads as coverage that is not
+/// there. `loopback_spellings_normalise_to_one_host` and
+/// `bracketed_ipv6_loopback_is_a_loopback_host` pin both halves of that.
 fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]")
 }
 
 fn validate_redirect_uri(uri: &str, key: &str) -> Result<()> {
@@ -426,5 +434,79 @@ mod tests {
         )
         .unwrap();
         assert_eq!(messy.len(), 1);
+    }
+
+    /// The alternate spellings of the IPv4 loopback address must land on the
+    /// same outcome as `127.0.0.1`, in both directions: as a requested
+    /// `redirect_uri` and as an allowlist entry an operator wrote.
+    ///
+    /// That behaviour comes entirely from the `url` crate's host
+    /// normalisation, not from anything this repo wrote, which is the argument
+    /// for pinning it: a crate bump changes it with nothing else going red,
+    /// and without this test the repo carries no statement of which spellings
+    /// it expects to admit.
+    #[test]
+    fn loopback_spellings_normalise_to_one_host() {
+        let allowed = parse_allowlist("http://127.0.0.1:8787/callback", "TEST").unwrap();
+
+        for uri in [
+            "http://127.0.0.1:49152/callback",
+            "http://127.1:49152/callback",
+            "http://0177.0.0.1:49152/callback",
+            "http://2130706433:49152/callback",
+        ] {
+            assert!(
+                is_allowed_redirect_uri(&allowed, uri),
+                "should accept {uri}"
+            );
+        }
+
+        // Normalising is not widening: a neighbouring loopback address is
+        // still a different host.
+        assert!(!is_allowed_redirect_uri(
+            &allowed,
+            "http://127.0.0.2:49152/callback"
+        ));
+
+        // And the same holds when the operator writes the odd spelling into
+        // the allowlist, so an unusual entry cannot admit more than the plain
+        // one does.
+        let spelled = parse_allowlist("http://2130706433:8787/callback", "TEST").unwrap();
+        assert!(is_allowed_redirect_uri(
+            &spelled,
+            "http://127.0.0.1:49152/callback"
+        ));
+        assert!(!is_allowed_redirect_uri(
+            &spelled,
+            "http://127.0.0.2:49152/callback"
+        ));
+    }
+
+    /// IPv6 loopback. `Url::host_str()` returns the bracketed form for every
+    /// IPv6 host, so `[::1]` is the only spelling `is_loopback_host` can ever
+    /// be asked about — an unbracketed authority does not parse as a URL at
+    /// all. Pinning that is what keeps the unreachable `"::1"` arm from being
+    /// added back as if it covered something.
+    #[test]
+    fn bracketed_ipv6_loopback_is_a_loopback_host() {
+        let allowed = parse_allowlist("http://[::1]:8787/callback", "TEST").unwrap();
+
+        assert!(is_allowed_redirect_uri(
+            &allowed,
+            "http://[::1]:49152/callback"
+        ));
+        // Another IPv6 address is not loopback, and cleartext on it never
+        // passes validation.
+        assert!(!is_allowed_redirect_uri(
+            &allowed,
+            "http://[::2]:49152/callback"
+        ));
+        // The port relaxation does not cross address families either.
+        assert!(!is_allowed_redirect_uri(
+            &allowed,
+            "http://127.0.0.1:49152/callback"
+        ));
+        // The unbracketed form is not a case that can arise.
+        assert!(parse_allowlist("http://::1:8787/callback", "TEST").is_err());
     }
 }

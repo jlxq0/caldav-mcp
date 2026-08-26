@@ -110,3 +110,11 @@ cargo test --all-features --locked
   feed the test the running system or stop naming it after it: keep the
   snapshot, date it, record the command that reads the live value, and assert
   per entry so a substitution fails where a count cannot.
+- `is_loopback_host` only ever sees `Url::host_str()` output, which the `url`
+  crate has already normalised: `127.1`, `0177.0.0.1` and `2130706433` all
+  arrive as `127.0.0.1`, and an IPv6 host always arrives bracketed. Which
+  spellings the allowlist admits is therefore a dependency's behaviour, not
+  this repo's, so it is pinned by test rather than assumed — a crate bump would
+  change it with nothing else going red. An unbracketed `"::1"` arm was
+  unreachable for the same reason and was removed; in a security predicate an
+  unreachable arm reads as coverage that is not there. Do not add it back.
