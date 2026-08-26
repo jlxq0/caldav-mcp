@@ -259,6 +259,16 @@ async fn initialize_rate_limit(
         }
         return response;
     }
+    // The denominator. Without it the refusal counter can say how often an
+    // identity was turned away and not out of how many attempts, which is the
+    // question the refusal counter was added to investigate. `user_hash` keeps
+    // the per-identity count out of metric labels, where it would be unbounded
+    // cardinality.
+    tracing::info!(
+        user_hash = %audit::identity_hash(&identity.user_id),
+        "admitted MCP initialize"
+    );
+    metrics::record_initialize_admitted();
     next.run(request).await
 }
 

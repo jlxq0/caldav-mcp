@@ -35,8 +35,8 @@ use std::time::Duration;
 use axum::http::header;
 use axum::response::IntoResponse;
 use prometheus::{
-    Encoder, HistogramVec, IntCounterVec, TextEncoder, register_histogram_vec_with_registry,
-    register_int_counter_vec_with_registry,
+    Encoder, HistogramVec, IntCounter, IntCounterVec, TextEncoder,
+    register_histogram_vec_with_registry, register_int_counter_vec_with_registry,
 };
 use std::sync::LazyLock;
 
@@ -106,6 +106,26 @@ pub static INITIALIZE_REFUSALS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(||
     .expect("register initialize_refusals_total once")
 });
 
+/// Admitted `initialize` requests: the denominator the refusal counter needs.
+///
+/// A refusal counter alone answers "how often were they turned away" and not
+/// "out of how many", so it cannot produce a rate and cannot say how many
+/// sessions an identity opened — which is the question the refusal counter was
+/// added to investigate. Counting only the bad outcome is instrumentation
+/// built for the failure and blind to the baseline.
+///
+/// This counts `initialize` requests **this server admitted**, which is not
+/// the same as sessions rmcp went on to create. The limiter is the last gate
+/// before the MCP router and the only one that can be observed here.
+pub static INITIALIZE_ADMITTED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    prometheus::register_int_counter_with_registry!(
+        "caldav_mcp_initialize_admitted_total",
+        "MCP initialize requests admitted by the per-identity session limiter.",
+        prometheus::default_registry()
+    )
+    .expect("register initialize_admitted_total once")
+});
+
 /// Initialize all metrics. Idempotent — `LazyLock` ensures
 /// registration only happens once. Call this once at startup so the
 /// scraped `/metrics` text always lists the families even before
@@ -116,6 +136,7 @@ pub fn init() {
     LazyLock::force(&INTROSPECT_TOTAL);
     LazyLock::force(&INTROSPECT_LATENCY_SECONDS);
     LazyLock::force(&INITIALIZE_REFUSALS_TOTAL);
+    LazyLock::force(&INITIALIZE_ADMITTED_TOTAL);
 }
 
 /// Record a finished tool call.
@@ -135,6 +156,11 @@ pub fn record_tool_call(tool: &str, outcome: &str, elapsed: Duration) {
 /// one that was firing recorded nothing.
 pub fn record_initialize_refusal(scope: &str) {
     INITIALIZE_REFUSALS_TOTAL.with_label_values(&[scope]).inc();
+}
+
+/// Record an `initialize` the limiter admitted.
+pub fn record_initialize_admitted() {
+    INITIALIZE_ADMITTED_TOTAL.inc();
 }
 
 /// Record a finished introspection round-trip.
@@ -215,5 +241,31 @@ mod tests {
             .collect();
         assert!(names.contains(&"caldav_mcp_tool_calls_total"));
         assert!(names.contains(&"caldav_mcp_introspect_total"));
+    }
+
+    /// The refusal counter and the admitted counter are separate families, so
+    /// a refusal can never be mistaken for an attempt. Sharing one would make
+    /// the rate this pair exists to produce unreadable.
+    #[test]
+    fn admitted_and_refused_are_counted_separately() {
+        init();
+        INITIALIZE_REFUSALS_TOTAL
+            .with_label_values(&["__test_scope"])
+            .reset();
+        let admitted_before = INITIALIZE_ADMITTED_TOTAL.get();
+
+        record_initialize_admitted();
+        record_initialize_admitted();
+        INITIALIZE_REFUSALS_TOTAL
+            .with_label_values(&["__test_scope"])
+            .inc();
+
+        assert_eq!(INITIALIZE_ADMITTED_TOTAL.get(), admitted_before + 2);
+        assert_eq!(
+            INITIALIZE_REFUSALS_TOTAL
+                .with_label_values(&["__test_scope"])
+                .get(),
+            1
+        );
     }
 }
