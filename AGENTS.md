@@ -211,3 +211,23 @@ cargo test --all-features --locked
   anonymiser, do not log the raw address instead, and do not mistake it for
   `token_hash` — that mis-reading is why nobody could say whose the tool calls
   were for several hours.
+- **A rollout destroys this service's `kubectl` log history, and `--previous`
+  does not help.** ArgoCD replaces the pod rather than restarting the
+  container, so `--previous` has no prior container to read and returns
+  nothing. On 2026-08-26 the v0.2.0 rollout erased the 58 tool-call lines that
+  were the evidence base for the investigation that motivated the release, at
+  the moment the release succeeded. `alloy` ships to Loki and holds fourteen
+  days, which is where the history actually lives:
+
+      sum by (uh) (count_over_time({namespace="caldav-mcp"}
+        | regexp `"user_hash":"(?P<uh>[0-9a-f]+)"` [14d]))
+
+- **Query those logs with `regexp`, not `| json`.** This service emits nested
+  `tracing` JSON, so every field sits under `fields` and Loki's `json` parser
+  produces `fields_user_hash`. A filter on `user_hash` therefore **matches
+  nothing against lines that demonstrably exist**, and an identity that never
+  appeared produces the identical empty set. A parser that cannot see a field
+  and a field that was never written are the same result, which is the same
+  shape as a 429 that names no limiter and a mutation that never applied. The
+  `regexp` form does not depend on the parser. Cross-check any zero against a
+  line you can see in `kubectl logs` before believing it.
