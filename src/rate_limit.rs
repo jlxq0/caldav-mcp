@@ -43,16 +43,9 @@ use std::num::NonZeroU32;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use governor::clock::DefaultClock;
+use governor::clock::{Clock, DefaultClock};
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
-
-/// Maximum number of fresh MCP sessions a single bearer token or Logto
-/// subject may open in a short burst. Legitimate Claude usage normally
-/// needs one or two live sessions; this leaves headroom for reconnects
-/// while preventing one authenticated identity from filling the global
-/// session pool (`session::MAX_SESSIONS`).
-pub const MAX_INITIALIZES_PER_IDENTITY: u32 = 8;
 
 const MAX_BUCKETS_PER_MAP: usize = 4096;
 #[allow(unknown_lints)]
@@ -231,16 +224,23 @@ impl InitializeLimiter {
     /// from the limiter's own bucket map filling, which is not a quota
     /// refusal at all.
     pub fn check(&self, bearer_hash: &str, sub: Option<&str>) -> Result<(), InitializeRefusal> {
+        let clock = DefaultClock::default();
         let bearer_bucket = get_or_insert_with_quota(&self.bearer, bearer_hash, self.quota)
-            .map_err(|RateLimited| InitializeRefusal::BucketCapacity)?;
-        if bearer_bucket.check().is_err() {
-            return Err(InitializeRefusal::Bearer);
+            .map_err(|RateLimited| InitializeRefusal::capacity())?;
+        if let Err(not_until) = bearer_bucket.check() {
+            return Err(InitializeRefusal::quota(
+                RefusalScope::Bearer,
+                not_until.wait_time_from(clock.now()),
+            ));
         }
         if let Some(s) = sub {
             let sub_bucket = get_or_insert_with_quota(&self.sub, s, self.quota)
-                .map_err(|RateLimited| InitializeRefusal::BucketCapacity)?;
-            if sub_bucket.check().is_err() {
-                return Err(InitializeRefusal::Subject);
+                .map_err(|RateLimited| InitializeRefusal::capacity())?;
+            if let Err(not_until) = sub_bucket.check() {
+                return Err(InitializeRefusal::quota(
+                    RefusalScope::Subject,
+                    not_until.wait_time_from(clock.now()),
+                ));
             }
         }
         Ok(())
@@ -254,7 +254,7 @@ impl InitializeLimiter {
 /// attempt gets a new bearer bucket and the same subject bucket, so the
 /// subject bucket is the one that runs out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InitializeRefusal {
+pub enum RefusalScope {
     /// Per-bearer-token bucket empty: one token reconnecting.
     Bearer,
     /// Per-subject bucket empty: one identity across rotated tokens.
@@ -264,7 +264,7 @@ pub enum InitializeRefusal {
     BucketCapacity,
 }
 
-impl InitializeRefusal {
+impl RefusalScope {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -272,6 +272,46 @@ impl InitializeRefusal {
             Self::Subject => "subject",
             Self::BucketCapacity => "bucket_capacity",
         }
+    }
+}
+
+/// A refused `initialize`, carrying both which bucket refused and how long
+/// until one slot exists.
+///
+/// `retry_after` comes from the bucket's own `NotUntil`, never from the
+/// configured burst and period. Those two agree only until the quota changes,
+/// and the quota changes in the same release that adds this field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitializeRefusal {
+    pub scope: RefusalScope,
+    /// `None` for `BucketCapacity`: no bucket was allocated, so there is
+    /// nothing to ask. Reporting a fabricated wait there would be the same
+    /// fault as the window length, one case over.
+    pub retry_after: Option<Duration>,
+}
+
+impl InitializeRefusal {
+    const fn quota(scope: RefusalScope, retry_after: Duration) -> Self {
+        Self {
+            scope,
+            retry_after: Some(retry_after),
+        }
+    }
+
+    const fn capacity() -> Self {
+        Self {
+            scope: RefusalScope::BucketCapacity,
+            retry_after: None,
+        }
+    }
+
+    /// Seconds for a `Retry-After` header, rounded **up**: rounding down
+    /// returns a moment at which the slot still does not exist, and the client
+    /// retries into a second refusal.
+    #[must_use]
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        self.retry_after
+            .map(|d| d.as_secs().saturating_add(u64::from(d.subsec_nanos() > 0)))
     }
 }
 
@@ -370,9 +410,11 @@ mod tests {
     fn a_refusal_names_the_bearer_bucket() {
         let l = InitializeLimiter::new(Duration::from_secs(60), 1);
         l.check("same-token", Some("user")).unwrap();
-        assert_eq!(
-            l.check("same-token", Some("user")),
-            Err(InitializeRefusal::Bearer)
+        let refusal = l.check("same-token", Some("user")).unwrap_err();
+        assert_eq!(refusal.scope, RefusalScope::Bearer);
+        assert!(
+            refusal.retry_after.is_some(),
+            "a quota refusal must carry the wait, since the caller cannot compute it"
         );
     }
 
@@ -384,21 +426,70 @@ mod tests {
     fn a_refusal_names_the_subject_bucket() {
         let l = InitializeLimiter::new(Duration::from_secs(60), 1);
         l.check("token-one", Some("user")).unwrap();
+        let refusal = l.check("token-two", Some("user")).unwrap_err();
         assert_eq!(
-            l.check("token-two", Some("user")),
-            Err(InitializeRefusal::Subject),
+            refusal.scope,
+            RefusalScope::Subject,
             "a fresh token must not be reported as its own bucket refusing"
         );
     }
 
     #[test]
     fn refusal_scopes_have_distinct_log_values() {
-        for (refusal, expected) in [
-            (InitializeRefusal::Bearer, "bearer"),
-            (InitializeRefusal::Subject, "subject"),
-            (InitializeRefusal::BucketCapacity, "bucket_capacity"),
+        for (scope, expected) in [
+            (RefusalScope::Bearer, "bearer"),
+            (RefusalScope::Subject, "subject"),
+            (RefusalScope::BucketCapacity, "bucket_capacity"),
         ] {
-            assert_eq!(refusal.as_str(), expected);
+            assert_eq!(scope.as_str(), expected);
         }
+    }
+
+    /// The wait comes from the bucket. Deriving it from the burst and the
+    /// period would agree with the bucket only until the quota changes, and
+    /// the quota changes in the release that adds this.
+    #[test]
+    fn a_quota_refusal_carries_a_wait_within_the_refill_period() {
+        let l = InitializeLimiter::new(Duration::from_secs(60), 1);
+        l.check("token", None).unwrap();
+        let refusal = l.check("token", None).unwrap_err();
+        let wait = refusal.retry_after.unwrap();
+        // Strictly less than the period, which is what separates a wait read
+        // from the bucket from one re-derived from the quota: time passed
+        // between spending the cell and asking, and only the bucket knows it.
+        // `<=` would accept exactly the substitution this test forbids.
+        assert!(
+            wait > Duration::ZERO && wait < Duration::from_secs(60),
+            "wait {wait:?} must be inside one refill period and reflect elapsed time"
+        );
+    }
+
+    /// Rounding a sub-second wait down to zero hands the client a moment at
+    /// which the slot still does not exist, and it retries into a second
+    /// refusal — the exact experience this change is removing.
+    #[test]
+    fn retry_after_seconds_rounds_up() {
+        let refusal = InitializeRefusal {
+            scope: RefusalScope::Bearer,
+            retry_after: Some(Duration::from_millis(1)),
+        };
+        assert_eq!(refusal.retry_after_secs(), Some(1));
+
+        let exact = InitializeRefusal {
+            scope: RefusalScope::Bearer,
+            retry_after: Some(Duration::from_secs(30)),
+        };
+        assert_eq!(exact.retry_after_secs(), Some(30));
+    }
+
+    /// No bucket was allocated, so there is nothing to ask. A fabricated wait
+    /// here would be the window-length fault one case over.
+    #[test]
+    fn a_capacity_refusal_carries_no_wait() {
+        let refusal = InitializeRefusal {
+            scope: RefusalScope::BucketCapacity,
+            retry_after: None,
+        };
+        assert_eq!(refusal.retry_after_secs(), None);
     }
 }

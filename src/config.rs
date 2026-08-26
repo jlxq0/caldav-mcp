@@ -9,6 +9,7 @@
 
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use url::Url;
@@ -50,6 +51,10 @@ const ENV_RATE_LIMIT_READS: &str = "CALDAV_MCP_RATE_LIMIT_READS_PER_MIN";
 /// Per-identity write quota (per minute).
 const ENV_RATE_LIMIT_WRITES: &str = "CALDAV_MCP_RATE_LIMIT_WRITES_PER_MIN";
 /// Number of trusted proxies in front of caldav-mcp. Default 1 (Traefik).
+/// Fresh MCP sessions one identity may open back to back.
+const ENV_INITIALIZE_BURST: &str = "CALDAV_MCP_INITIALIZE_BURST";
+/// Seconds between refilled `initialize` slots once the burst is spent.
+const ENV_INITIALIZE_REFILL_SECONDS: &str = "CALDAV_MCP_INITIALIZE_REFILL_SECONDS";
 const ENV_TRUSTED_PROXY_HOPS: &str = "CALDAV_MCP_TRUSTED_PROXY_HOPS";
 /// Optional IP to connect to when reaching the Stalwart host, overriding DNS.
 /// Used in-cluster to avoid hairpin NAT on the public `LoadBalancer`: we keep
@@ -98,6 +103,13 @@ pub struct Config {
     pub dcr_client_id: Option<String>,
     /// Exact OAuth redirect URIs accepted by the proxy and DCR shim.
     pub oauth_redirect_uris: Vec<String>,
+    /// Fresh MCP sessions one identity may open back to back.
+    pub initialize_burst: u32,
+    /// Interval at which one `initialize` slot refills once the burst is
+    /// spent. One slot at a time, never the whole burst at once — the
+    /// `Retry-After` we return is derived from the bucket rather than from
+    /// this value, because the two agree only until the quota changes.
+    pub initialize_refill: Duration,
     /// Absolute-URI JWT audience Stalwart's OIDC directory requires.
     /// The OAuth proxy sends this as the RFC 8707 `resource` to Logto
     /// (Logto rejects non-URI indicators with `invalid_target`). Default
@@ -149,6 +161,8 @@ impl Config {
             stalwart_connect_ip: None,
             dcr_client_id: None,
             oauth_redirect_uris: Vec::new(),
+            initialize_burst: DEFAULT_INITIALIZE_BURST,
+            initialize_refill: DEFAULT_INITIALIZE_REFILL,
             stalwart_audience: resource_url,
         })
     }
@@ -209,6 +223,8 @@ impl Config {
             .ok()
             .filter(|s| !s.trim().is_empty());
         cfg.oauth_redirect_uris = parse_redirect_uris_env()?;
+        cfg.initialize_burst = parse_initialize_burst()?;
+        cfg.initialize_refill = parse_initialize_refill()?;
         cfg.stalwart_audience = match std::env::var(ENV_STALWART_AUDIENCE)
             .ok()
             .map(|s| s.trim().to_owned())
@@ -315,6 +331,51 @@ fn parse_rate_limit(key: &str, default: u32) -> Result<u32> {
 fn parse_redirect_uris_env() -> Result<Vec<String>> {
     let raw = require_env(oauth_redirect::ENV_OAUTH_REDIRECT_URIS)?;
     oauth_redirect::parse_allowlist(&raw, oauth_redirect::ENV_OAUTH_REDIRECT_URIS)
+}
+
+/// Default `initialize` burst. Raised from 8 on 2026-08-26: eight was reached
+/// by ordinary use, and the refusal was indistinguishable from a failure.
+/// 24 covers the observed workload exactly. It is not 32 because that would
+/// take the identities-needed-to-fill `session::MAX_SESSIONS` from 32 down to
+/// 8, and moving the pool with it needs a per-session memory measurement that
+/// is blocked on a credential.
+pub const DEFAULT_INITIALIZE_BURST: u32 = 24;
+
+/// Default refill: one slot per minute. **This is the change that matters.**
+/// At the previous 30 minutes a user who waited out what they believed was the
+/// window got exactly one session, reconnected twice and was refused again —
+/// so a wrong model of the rule did not merely delay them, it guaranteed a
+/// second failure. Four hours to recover from empty becomes 24 minutes.
+pub const DEFAULT_INITIALIZE_REFILL: Duration = Duration::from_secs(60);
+
+fn parse_initialize_burst() -> Result<u32> {
+    std::env::var(ENV_INITIALIZE_BURST).map_or_else(
+        |_| Ok(DEFAULT_INITIALIZE_BURST),
+        |raw| {
+            let value: u32 = raw.trim().parse().with_context(|| {
+                format!("{ENV_INITIALIZE_BURST} must be a positive integer, got: {raw}")
+            })?;
+            if value == 0 {
+                anyhow::bail!("{ENV_INITIALIZE_BURST} must be greater than zero");
+            }
+            Ok(value)
+        },
+    )
+}
+
+fn parse_initialize_refill() -> Result<Duration> {
+    std::env::var(ENV_INITIALIZE_REFILL_SECONDS).map_or_else(
+        |_| Ok(DEFAULT_INITIALIZE_REFILL),
+        |raw| {
+            let secs: u64 = raw.trim().parse().with_context(|| {
+                format!("{ENV_INITIALIZE_REFILL_SECONDS} must be a positive integer number of seconds, got: {raw}")
+            })?;
+            if secs == 0 {
+                anyhow::bail!("{ENV_INITIALIZE_REFILL_SECONDS} must be greater than zero");
+            }
+            Ok(Duration::from_secs(secs))
+        },
+    )
 }
 
 fn parse_trusted_proxy_hops() -> Result<usize> {

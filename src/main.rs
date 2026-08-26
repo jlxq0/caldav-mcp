@@ -41,7 +41,7 @@ use crate::config::Config;
 use crate::logto_oidc::LogtoValidationClient;
 use crate::mcp::CaldavMcpService;
 use crate::oauth_metadata::{authorization_server_metadata, protected_resource_metadata, register};
-use crate::rate_limit::{InitializeLimiter, Limiter, MAX_INITIALIZES_PER_IDENTITY};
+use crate::rate_limit::{InitializeLimiter, Limiter};
 
 /// rmcp collects a complete JSON-RPC body before decoding it, so the service
 /// boundary must cap the stream first. This is well above normal MCP payloads.
@@ -138,8 +138,8 @@ fn build_router(
     );
 
     let initialize_limiter = Arc::new(InitializeLimiter::new(
-        session::SESSION_KEEP_ALIVE,
-        MAX_INITIALIZES_PER_IDENTITY,
+        config.initialize_refill,
+        config.initialize_burst,
     ));
     let session_bindings = session::SessionIdentityBindings::new();
 
@@ -228,23 +228,36 @@ async fn initialize_rate_limit(
     };
     let bearer_hash = audit::token_hash(&token.0);
     if let Err(refusal) = limiter.check(&bearer_hash, Some(identity.user_id.as_str())) {
+        let retry_after = refusal.retry_after_secs();
         // The only record that this branch was taken. Until this line existed,
-        // a user hitting the limit produced no server-side evidence at all —
+        // a user hitting the limit produced no server-side evidence at all:
         // auth succeeded, no tool call followed, and the gap between them was
-        // the whole diagnosis. `scope` is what separates one token
-        // reconnecting from one identity rotating tokens.
+        // the whole diagnosis. It is also why a 429 from the connector's own
+        // proxy could not be told apart from one of ours. `scope` separates
+        // one token reconnecting from one identity rotating tokens, and
+        // `user_hash` separates two people on the same server in one grep.
         tracing::warn!(
-            scope = refusal.as_str(),
+            scope = refusal.scope.as_str(),
             user_hash = %audit::identity_hash(&identity.user_id),
-            burst = rate_limit::MAX_INITIALIZES_PER_IDENTITY,
-            refill_seconds = session::SESSION_KEEP_ALIVE.as_secs(),
+            retry_after_seconds = retry_after,
             "refused MCP initialize: per-identity session quota exhausted"
         );
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many MCP initialize requests; try again later\n",
-        )
-            .into_response();
+        metrics::record_initialize_refusal(refusal.scope.as_str());
+        let body = serde_json::json!({
+            "error": "too_many_sessions",
+            "scope": refusal.scope.as_str(),
+            "retry_after_seconds": retry_after,
+            "message": "too many MCP sessions opened by this identity; slots refill one at a \
+                        time, so retry_after_seconds is when the next one exists, not when the \
+                        whole allowance returns",
+        });
+        let mut response = (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();
+        if let Some(secs) = retry_after
+            && let Ok(value) = axum::http::HeaderValue::from_str(&secs.to_string())
+        {
+            response.headers_mut().insert("retry-after", value);
+        }
+        return response;
     }
     next.run(request).await
 }

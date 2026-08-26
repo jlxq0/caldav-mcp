@@ -162,3 +162,38 @@ cargo test --all-features --locked
   treat a missing `test result:` line as a failed run rather than a clean one —
   a mutation that never applied looks exactly like a test suite that caught
   nothing.
+- A limiter that is right and silent produces a user retrying blind against a
+  correct rule, and every retry looks to them like the rule being broken. The
+  `initialize` limiter refused correctly for hours while emitting nothing: no
+  log line, no `Retry-After`, no error class, and `tool_calls_total` reading
+  zero because the limiter is Axum middleware outside the MCP router, so a
+  refusal never reaches the code that increments it. **A correct refusal that
+  carries no information is the same object as a green that carries none.**
+  Every limiter here logs which bucket refused, counts the refusal, and returns
+  the wait taken from the bucket rather than re-derived from the configured
+  period — those two agree only until someone changes the quota.
+- Slots refill one at a time, so recovering from empty takes burst x refill and
+  not one refill. Reporting the period as the retry hint tells a user to wait
+  for a whole allowance they will not get: they come back, receive exactly one
+  session, reconnect twice and are refused again. A wrong model of a limiter
+  does not merely delay someone, it guarantees a second failure after the wait.
+- The `initialize` burst and `session::MAX_SESSIONS` move together or not at
+  all. At burst 8 it takes 32 identities to exhaust a 256-session pool; at
+  burst 32 it takes 8. Raising the burst alone converts a per-user refusal into
+  a global exhaustion, which is invisible in the diff and breaks somebody other
+  than the person who triggered it.
+- `audit::identity_hash` and `audit::token_hash` are the same function with
+  different domains: `sha256(domain || ":" || value)[..8]`. **Only one of them
+  is unreversible.** A bearer is high-entropy, so `token_hash` answers nothing;
+  an email address comes from a small enumerable set, so `identity_hash`
+  reverses against a candidate list in one script. Reproduced 2026-08-26:
+
+      identity:julian@kampong.social       -> f5a076c6a6c82848
+      identity:julian@lindner.earth        -> e511ab93d01ff206
+      identity:caldav_test@kampong.social  -> 64ce710d59fb1d01
+
+  That is deliberate and it is why `user_hash` is the field that separates two
+  people on one server in a single grep. Read it as a pseudonym rather than an
+  anonymiser, do not log the raw address instead, and do not mistake it for
+  `token_hash` — that mis-reading is why nobody could say whose the tool calls
+  were for several hours.
