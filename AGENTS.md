@@ -231,3 +231,14 @@ cargo test --all-features --locked
   shape as a 429 that names no limiter and a mutation that never applied. The
   `regexp` form does not depend on the parser. Cross-check any zero against a
   line you can see in `kubectl logs` before believing it.
+- **When adding a counter for a bad outcome, ask whether anyone will need the
+  denominator.** `caldav_mcp_initialize_refusals_total` was added to answer how
+  many sessions an identity was opening, and could not: it counts only the
+  refusals, so it gives no rate and no baseline. A night was spent on that
+  question and the instrument built to investigate it was blind to it.
+  `caldav_mcp_initialize_admitted_total` is the other half. Note what it counts
+  and what it does not: requests the limiter **admitted**, which is not
+  sessions rmcp went on to create, because the limiter is the last gate that
+  can be observed from outside the MCP router. Per-identity counts go in the
+  log line as `user_hash`, never as a metric label, where a hash is unbounded
+  cardinality.
