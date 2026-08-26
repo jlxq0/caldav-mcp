@@ -93,7 +93,23 @@ pub struct Event {
     pub organizer: Option<String>,
     pub attendees: Vec<String>,
     pub recurrence_rule: Option<String>,
+    /// `RECURRENCE-ID` normalised to a UTC instant for display. **Not usable
+    /// for building an `EXDATE`:** an exclusion has to carry the same value
+    /// type and `TZID` the `RRULE` generates, and a UTC instant matches
+    /// nothing when the series is floating or has a `TZID`. Use the three
+    /// verbatim fields below for that.
     pub recurrence_id: Option<String>,
+    /// `RECURRENCE-ID`'s value exactly as the server wrote it, e.g.
+    /// `20260901T090000` or `20260901` for an all-day series.
+    pub recurrence_id_value: Option<String>,
+    /// The `TZID` parameter on `RECURRENCE-ID`, absent for UTC and floating
+    /// values.
+    pub recurrence_id_tzid: Option<String>,
+    /// The `RANGE` parameter on `RECURRENCE-ID`, normally `THISANDFUTURE`.
+    /// Surfaced rather than dropped: an override carrying it applies to the
+    /// occurrence *and every later one*, and a caller that cannot see it
+    /// treats a this-and-future override as a single-instance one.
+    pub recurrence_id_range: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -909,10 +925,16 @@ fn parse_ical_events(ics: &str, href: &str) -> Result<Vec<Event>, CaldavError> {
     Ok(events)
 }
 
+/// The master component of a calendar object, or the first one if every
+/// component is an override. Never simply the first: see
+/// [`master_event_start`] for what that cost.
 fn parse_ical_event(ics: &str, href: &str) -> Result<Event, CaldavError> {
-    parse_ical_events(ics, href)?
-        .into_iter()
-        .next()
+    let events = parse_ical_events(ics, href)?;
+    events
+        .iter()
+        .find(|event| event.recurrence_id.is_none())
+        .or_else(|| events.first())
+        .cloned()
         .ok_or_else(|| CaldavError::InvalidInput("calendar object has no VEVENT".to_owned()))
 }
 
@@ -975,6 +997,13 @@ fn event_from_lines(lines: &[String], href: String) -> Result<Event, CaldavError
             .transpose()?
             .as_ref()
             .map(render_temporal),
+        recurrence_id_value: property("RECURRENCE-ID").map(|(_, value)| value.to_owned()),
+        recurrence_id_tzid: property("RECURRENCE-ID")
+            .and_then(|(head, _)| parameter_value(head, "TZID"))
+            .map(ToOwned::to_owned),
+        recurrence_id_range: property("RECURRENCE-ID")
+            .and_then(|(head, _)| parameter_value(head, "RANGE"))
+            .map(str::to_uppercase),
     })
 }
 
@@ -1144,20 +1173,69 @@ fn patch_ics(ics: &str, patch: &EventPatch) -> Result<String, CaldavError> {
     Ok(format!("{}\r\n", lines.join("\r\n")))
 }
 
-fn event_lines(lines: &[String]) -> Vec<String> {
-    let mut event = Vec::new();
-    let mut inside = false;
-    for line in lines {
+/// Index of the `BEGIN:VEVENT` line starting the master component — the one
+/// with no `RECURRENCE-ID`.
+///
+/// A calendar object for a recurring series holds the master and one `VEVENT`
+/// per override, in no guaranteed order (RFC 5545 does not require the master
+/// to come first). Anchoring on the first `BEGIN:VEVENT` meant a `PUT` could
+/// rename one occurrence while reporting that it had renamed the series, and
+/// the caller saw a success with `recurrence_rule: null`.
+///
+/// Falls back to the first `VEVENT` when every component carries a
+/// `RECURRENCE-ID`, which is a resource we cannot patch coherently anyway.
+fn master_event_start(lines: &[String]) -> Option<usize> {
+    let mut first = None;
+    let mut current = None;
+    let mut nested_depth = 0_u32;
+    let mut has_recurrence_id = false;
+    for (index, line) in lines.iter().enumerate() {
         if line.eq_ignore_ascii_case("BEGIN:VEVENT") {
-            inside = true;
+            current = Some(index);
+            first = first.or(Some(index));
+            nested_depth = 0;
+            has_recurrence_id = false;
             continue;
         }
         if line.eq_ignore_ascii_case("END:VEVENT") {
+            if current.is_some() && !has_recurrence_id {
+                return current;
+            }
+            current = None;
+            continue;
+        }
+        if current.is_none() {
+            continue;
+        }
+        if line.starts_with("BEGIN:") {
+            nested_depth = nested_depth.saturating_add(1);
+            continue;
+        }
+        if line.starts_with("END:") && nested_depth > 0 {
+            nested_depth = nested_depth.saturating_sub(1);
+            continue;
+        }
+        if nested_depth == 0
+            && line
+                .split_once(':')
+                .is_some_and(|(head, _)| property_name(head).eq_ignore_ascii_case("RECURRENCE-ID"))
+        {
+            has_recurrence_id = true;
+        }
+    }
+    first
+}
+
+fn event_lines(lines: &[String]) -> Vec<String> {
+    let Some(start) = master_event_start(lines) else {
+        return Vec::new();
+    };
+    let mut event = Vec::new();
+    for line in lines.iter().skip(start + 1) {
+        if line.eq_ignore_ascii_case("END:VEVENT") {
             break;
         }
-        if inside {
-            event.push(line.clone());
-        }
+        event.push(line.clone());
     }
     event
 }
@@ -1182,12 +1260,15 @@ fn direct_event_properties(lines: &[String]) -> Vec<String> {
 }
 
 fn replace_event_property(lines: &mut Vec<String>, name: &str, replacement: Vec<String>) {
+    let Some(start) = master_event_start(lines) else {
+        return;
+    };
     let mut inside = false;
     let mut nested_depth = 0_u32;
     let mut insertion = None;
-    let mut index = 0;
+    let mut index = start;
     while index < lines.len() {
-        if lines[index].eq_ignore_ascii_case("BEGIN:VEVENT") {
+        if index == start && lines[index].eq_ignore_ascii_case("BEGIN:VEVENT") {
             inside = true;
             index += 1;
             continue;
@@ -1846,4 +1927,116 @@ mod tests {
 
         assert!(matches!(result, Err(CaldavError::Unauthorized)));
     }
+
+    /// A calendar object for a recurring series holds the master and one
+    /// `VEVENT` per override, and RFC 5545 does not require the master first.
+    /// Patching whichever component came first renamed a single occurrence
+    /// while reporting that the series had been renamed.
+    #[test]
+    fn patch_edits_the_master_when_an_override_is_written_first() {
+        let ics = OVERRIDE_FIRST_SERIES;
+        let patch = EventPatch {
+            summary: Some("Renamed".to_owned()),
+            ..Default::default()
+        };
+        let patched = patch_ics(ics, &patch).unwrap();
+        let summaries: Vec<&str> = patched
+            .lines()
+            .filter_map(|line| line.strip_prefix("SUMMARY:"))
+            .collect();
+        assert_eq!(
+            summaries,
+            vec!["Override", "Renamed"],
+            "the override must keep its own summary and the master must take the patch"
+        );
+        // The master's RRULE survives, and the override's RECURRENCE-ID is
+        // untouched — a patch that hit the wrong component would move one.
+        assert!(patched.contains("RRULE:FREQ=WEEKLY"));
+        assert!(
+            patched
+                .contains("RECURRENCE-ID;TZID=Asia/Singapore;RANGE=THISANDFUTURE:20260901T090000")
+        );
+    }
+
+    /// `update_event` returns this. Returning the override told the caller the
+    /// series had no `recurrence_rule`, which is the answer that makes a
+    /// client stop treating it as recurring.
+    #[test]
+    fn a_calendar_object_is_described_by_its_master_component() {
+        let event = parse_ical_event(OVERRIDE_FIRST_SERIES, "/c/series.ics").unwrap();
+        assert_eq!(event.summary.as_deref(), Some("Master"));
+        assert_eq!(event.recurrence_rule.as_deref(), Some("FREQ=WEEKLY"));
+        assert!(event.recurrence_id.is_none());
+    }
+
+    /// An `EXDATE` has to carry the same value type and `TZID` the `RRULE`
+    /// generates. The rendered `recurrence_id` is a UTC instant, so it cannot
+    /// be used to build one; the verbatim fields exist for that, and `RANGE`
+    /// is surfaced because an override carrying it applies to every later
+    /// occurrence too.
+    #[test]
+    fn recurrence_id_is_surfaced_verbatim_with_its_parameters() {
+        let events = parse_ical_events(OVERRIDE_FIRST_SERIES, "/c/series.ics").unwrap();
+        let override_instance = events
+            .iter()
+            .find(|event| event.recurrence_id.is_some())
+            .unwrap();
+
+        assert_eq!(
+            override_instance.recurrence_id_value.as_deref(),
+            Some("20260901T090000")
+        );
+        assert_eq!(
+            override_instance.recurrence_id_tzid.as_deref(),
+            Some("Asia/Singapore")
+        );
+        assert_eq!(
+            override_instance.recurrence_id_range.as_deref(),
+            Some("THISANDFUTURE")
+        );
+        // The rendered form is a different value, which is the whole reason
+        // the verbatim ones are carried alongside it.
+        assert_eq!(
+            override_instance.recurrence_id.as_deref(),
+            Some("2026-09-01T01:00:00Z")
+        );
+    }
+
+    /// No `RANGE` means no `RANGE`, rather than a default that would silently
+    /// widen a single-instance override.
+    #[test]
+    fn an_override_without_range_reports_none() {
+        let ics = concat!(
+            "BEGIN:VCALENDAR\r\n",
+            "BEGIN:VEVENT\r\nUID:series\r\nSUMMARY:Master\r\n",
+            "DTSTART;TZID=Asia/Singapore:20260801T090000\r\n",
+            "DTEND;TZID=Asia/Singapore:20260801T100000\r\nRRULE:FREQ=WEEKLY\r\n",
+            "END:VEVENT\r\n",
+            "BEGIN:VEVENT\r\nUID:series\r\nSUMMARY:One off\r\n",
+            "RECURRENCE-ID;VALUE=DATE:20260901\r\n",
+            "DTSTART;VALUE=DATE:20260901\r\nDTEND;VALUE=DATE:20260902\r\n",
+            "END:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+        let events = parse_ical_events(ics, "/c/series.ics").unwrap();
+        let instance = events
+            .iter()
+            .find(|event| event.recurrence_id.is_some())
+            .unwrap();
+        assert_eq!(instance.recurrence_id_value.as_deref(), Some("20260901"));
+        assert!(instance.recurrence_id_tzid.is_none());
+        assert!(instance.recurrence_id_range.is_none());
+    }
+
+    const OVERRIDE_FIRST_SERIES: &str = concat!(
+        "BEGIN:VCALENDAR\r\n",
+        "BEGIN:VEVENT\r\nUID:series\r\nSUMMARY:Override\r\n",
+        "RECURRENCE-ID;TZID=Asia/Singapore;RANGE=THISANDFUTURE:20260901T090000\r\n",
+        "DTSTART;TZID=Asia/Singapore:20260901T100000\r\n",
+        "DTEND;TZID=Asia/Singapore:20260901T110000\r\n",
+        "END:VEVENT\r\n",
+        "BEGIN:VEVENT\r\nUID:series\r\nSUMMARY:Master\r\n",
+        "DTSTART;TZID=Asia/Singapore:20260801T090000\r\n",
+        "DTEND;TZID=Asia/Singapore:20260801T100000\r\nRRULE:FREQ=WEEKLY\r\n",
+        "END:VEVENT\r\nEND:VCALENDAR\r\n"
+    );
 }
