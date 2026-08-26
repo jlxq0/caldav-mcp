@@ -4,6 +4,25 @@ This project follows semantic versioning while it is pre-1.0. This file and the
 signed `vX.Y.Z` tags are the release record; Forgejo release objects are not
 maintained, so their absence says nothing about whether a version shipped.
 
+## 0.2.1 - 2026-08-26
+
+### Added
+
+- One log line per authenticated request carrying the **number** of
+  `X-Forwarded-For` entries the pod received and the configured
+  `CALDAV_MCP_TRUSTED_PROXY_HOPS`, never the entries themselves. Both
+  deployments set 0, which blanks the recorded client IP before the header is
+  read; a value that is too low is worse, selecting an upstream proxy's address
+  and recording it as the client's. The correct value is the entry count, and
+  these two fields settle it from one real request.
+- `caldav_mcp_initialize_admitted_total` and one log line per admitted
+  `initialize` carrying the pseudonymous identity. 0.2.0 counted refusals only,
+  which gives no rate and no baseline, so the counter added to investigate how
+  many sessions an identity opens could not answer it. The per-identity count
+  is in the log rather than in a metric label, where a hash would be unbounded
+  cardinality. It counts requests the limiter admitted, which is not the same
+  as sessions the MCP layer went on to create.
+
 ## 0.2.0 - 2026-08-26
 
 ### Fixed
