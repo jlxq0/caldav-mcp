@@ -177,11 +177,25 @@ cargo test --all-features --locked
   for a whole allowance they will not get: they come back, receive exactly one
   session, reconnect twice and are refused again. A wrong model of a limiter
   does not merely delay someone, it guarantees a second failure after the wait.
-- The `initialize` burst and `session::MAX_SESSIONS` move together or not at
-  all. At burst 8 it takes 32 identities to exhaust a 256-session pool; at
-  burst 32 it takes 8. Raising the burst alone converts a per-user refusal into
-  a global exhaustion, which is invisible in the diff and breaks somebody other
-  than the person who triggered it.
+- The `initialize` burst and `session::MAX_SESSIONS` are coupled and stay
+  coupled. At burst 8 it takes 32 identities to exhaust a 256-session pool, at
+  24 about 10, at 32 exactly 8. Raising the burst alone does not remove the
+  coupling, it spends it: a per-user refusal becomes a global exhaustion,
+  invisible in the diff, breaking somebody other than the person who triggered
+  it. **What makes the current burst safe is the identity population, not the
+  number.** The bucket keys on the Logto `sub` and every agent on this machine
+  resolves to one identity, so the distinct-identity count is a handful rather
+  than ten. That is a property of today rather than of the design, and
+  `CALDAV_MCP_INITIALIZE_BURST` puts it one command from mattering.
+- **Read a Renovate rule against the manifest path, never against the
+  repository.** `clusters/fondue/*-www/**` is the manual-merge rule, and this
+  application's production path is `clusters/fondue/caldav-mcp`, so it falls
+  through to the BASELINE rule with `automerge: true` and `platformAutomerge`.
+  A minor bump therefore merges itself: `oddie-apps/platform#589` opened at
+  14:30 on 2026-08-26 and merged at 14:32 with nobody involved. Two people
+  described this path as gated by a human before anyone read the rule against
+  it. A pattern that silently declines is invisible, and so is a merge nobody
+  has to perform; this repository has the second.
 - `audit::identity_hash` and `audit::token_hash` are the same function with
   different domains: `sha256(domain || ":" || value)[..8]`. **Only one of them
   is unreversible.** A bearer is high-entropy, so `token_hash` answers nothing;
