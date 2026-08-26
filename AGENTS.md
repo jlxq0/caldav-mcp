@@ -102,3 +102,11 @@ cargo test --all-features --locked
   entry, whose host is loopback, port-relaxes into a cleartext
   `http://localhost:3118/callback` — an https→http downgrade on an entry the
   operator wrote expecting TLS.
+- A test named after the deployment is a claim about the running system, and it
+  rots silently. `deployed_allowlist_parses` asserted only that a string literal
+  it declared itself parsed to nine entries, so the deployment was never an
+  input and no drift could turn it red; the identical test in a sibling repo
+  carried nine entries against a live seven and stayed green throughout. Either
+  feed the test the running system or stop naming it after it: keep the
+  snapshot, date it, record the command that reads the live value, and assert
+  per entry so a substitution fails where a count cannot.

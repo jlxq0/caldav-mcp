@@ -308,9 +308,29 @@ mod tests {
         ));
     }
 
-    /// The exact set the deployment ships, parsed as one env value.
+    /// A hand-copied snapshot of the allowlist the deployment was running on
+    /// 2026-08-26, read off the running pod's container env rather than off a
+    /// manifest or a chart:
+    ///
+    /// ```text
+    /// kubectl -n caldav-mcp get pod -o jsonpath=\
+    ///   '{range .items[*].spec.containers[?(@.name=="app")].env[*]}{.name}={.value}{"\n"}{end}' \
+    ///   | grep REDIRECT
+    /// ```
+    ///
+    /// **This test cannot detect drift, and must not be read as if it could.**
+    /// `raw` is a literal, so the deployment is not an input and no change to
+    /// it can turn this red. What the test pins is matcher *behaviour* against
+    /// a shape production really had; the date says how old that claim is, and
+    /// the command above is how to renew it.
+    ///
+    /// It replaces a test named `deployed_allowlist_parses` that asserted only
+    /// `allowed.len() == 9` under the doc comment "the exact set the deployment
+    /// ships". `typst-mcp` carried the identical test with nine entries against
+    /// a live seven and stayed green the whole time. That is the failure being
+    /// named here, not a bug that was fixed.
     #[test]
-    fn deployed_allowlist_parses() {
+    fn production_allowlist_snapshot_behaves() {
         let raw = "https://claude.ai/api/mcp/auth_callback,\
                    https://claude.com/api/mcp/auth_callback,\
                    https://www.cursor.com/agents/mcp/oauth/callback,\
@@ -322,5 +342,89 @@ mod tests {
                    cowork://oauth/callback";
         let allowed = parse_allowlist(raw, ENV_OAUTH_REDIRECT_URIS).unwrap();
         assert_eq!(allowed.len(), 9);
+
+        // Every entry the deployment carries is accepted as written. Asserting
+        // this per entry rather than by count is what makes a substitution in
+        // the snapshot fail the test; a count cannot see one.
+        for uri in [
+            "https://claude.ai/api/mcp/auth_callback",
+            "https://claude.com/api/mcp/auth_callback",
+            "https://www.cursor.com/agents/mcp/oauth/callback",
+            "cursor://anysphere.cursor-mcp/oauth/callback",
+            "grokbot://mcp/oauth/callback",
+            "http://localhost:8787/callback",
+            "claude://claude.ai/oauth/callback",
+            "claude://oauth/callback",
+            "cowork://oauth/callback",
+        ] {
+            assert!(
+                is_allowed_redirect_uri(&allowed, uri),
+                "should accept {uri}"
+            );
+        }
+
+        // The one deployed loopback entry is the one a CLI client uses, and it
+        // must take whatever ephemeral port that client bound.
+        assert!(is_allowed_redirect_uri(
+            &allowed,
+            "http://localhost:49152/callback"
+        ));
+        // The port relaxation stops at the port: not the path, and not the
+        // scheme.
+        assert!(!is_allowed_redirect_uri(
+            &allowed,
+            "http://localhost:49152/oauth/callback"
+        ));
+        assert!(!is_allowed_redirect_uri(
+            &allowed,
+            "https://localhost:49152/callback"
+        ));
+        // Nothing non-loopback in the deployed set gets a port relaxed.
+        assert!(!is_allowed_redirect_uri(
+            &allowed,
+            "https://claude.ai:8443/api/mcp/auth_callback"
+        ));
+        assert!(!is_allowed_redirect_uri(
+            &allowed,
+            "cowork://oauth:8443/callback"
+        ));
+        // And the set is still an allowlist.
+        assert!(!is_allowed_redirect_uri(
+            &allowed,
+            "https://attacker.example/callback"
+        ));
+    }
+
+    /// Shapes the allowlist must keep parsing and matching, whether or not the
+    /// deployment currently lists them: `https`, cleartext loopback, and the
+    /// private-use schemes native MCP clients register. Makes no claim about
+    /// production — see `production_allowlist_snapshot_behaves` for the
+    /// snapshot, and note that it cannot detect drift either.
+    #[test]
+    fn allowlist_accepts_the_shapes_we_support() {
+        let raw = "https://claude.ai/api/mcp/auth_callback,\
+                   http://127.0.0.1:8787/callback,\
+                   claude://oauth/callback";
+        let allowed = parse_allowlist(raw, ENV_OAUTH_REDIRECT_URIS).unwrap();
+        assert_eq!(allowed.len(), 3);
+
+        assert!(is_allowed_redirect_uri(
+            &allowed,
+            "https://claude.ai/api/mcp/auth_callback"
+        ));
+        assert!(is_allowed_redirect_uri(
+            &allowed,
+            "http://127.0.0.1:49152/callback"
+        ));
+        assert!(is_allowed_redirect_uri(&allowed, "claude://oauth/callback"));
+
+        // Duplicates collapse and surrounding whitespace is tolerated, because
+        // an operator writes this env value by hand.
+        let messy = parse_allowlist(
+            " https://claude.ai/api/mcp/auth_callback , https://claude.ai/api/mcp/auth_callback ",
+            ENV_OAUTH_REDIRECT_URIS,
+        )
+        .unwrap();
+        assert_eq!(messy.len(), 1);
     }
 }
