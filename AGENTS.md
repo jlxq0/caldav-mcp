@@ -95,3 +95,10 @@ cargo test --all-features --locked
   server misconfiguration. Relax the port for loopback `http` entries only, and
   keep scheme, host, path and query exact; a port relaxation applied to `https`
   or private-use entries would admit a different origin.
+- A guard written as `if a != x || b != x` is two conditions, and a test that
+  exercises one side leaves the other free to be deleted with the suite still
+  green. Assert per side. In `oauth_redirect.rs` the unpinned side was the
+  allowlist entry's scheme: drop it and an `https://localhost:8443/callback`
+  entry, whose host is loopback, port-relaxes into a cleartext
+  `http://localhost:3118/callback` — an https→http downgrade on an entry the
+  operator wrote expecting TLS.
