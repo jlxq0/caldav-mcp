@@ -141,3 +141,15 @@ cargo test --all-features --locked
 - A beta must sort above the release it replaces. `0.1.2-beta.<ts>` sorts below
   `0.1.2`, so beta would read as older than production while running newer code;
   `bin/ci-version` bumps the base first for that reason.
+- A calendar object for a recurring series holds the master `VEVENT` and one
+  per override, in no guaranteed order — RFC 5545 does not require the master
+  first. Anchoring on the first `BEGIN:VEVENT` made `update_event` rename a
+  single occurrence while reporting the series renamed, and return
+  `recurrence_rule: null` for a series that has one. Select the component with
+  no `RECURRENCE-ID`; `master_event_start` is the one place that decides.
+- `RECURRENCE-ID` rendered as a UTC instant cannot build an `EXDATE`. An
+  exclusion has to carry the same value type and `TZID` the `RRULE` generates,
+  so `Event` also carries `recurrence_id_value`, `recurrence_id_tzid` and
+  `recurrence_id_range` verbatim. `RANGE=THISANDFUTURE` in particular means the
+  override applies to that occurrence and every later one; dropping it, as the
+  parser did, presents a this-and-future override as a single-instance one.
