@@ -1,6 +1,6 @@
 [package]
 name = "caldav-mcp"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.93"
 description = "Remote MCP server exposing a Stalwart CalDAV calendar over streamable HTTP"
