@@ -227,10 +227,19 @@ async fn initialize_rate_limit(
             .into_response();
     };
     let bearer_hash = audit::token_hash(&token.0);
-    if limiter
-        .check(&bearer_hash, Some(identity.user_id.as_str()))
-        .is_err()
-    {
+    if let Err(refusal) = limiter.check(&bearer_hash, Some(identity.user_id.as_str())) {
+        // The only record that this branch was taken. Until this line existed,
+        // a user hitting the limit produced no server-side evidence at all —
+        // auth succeeded, no tool call followed, and the gap between them was
+        // the whole diagnosis. `scope` is what separates one token
+        // reconnecting from one identity rotating tokens.
+        tracing::warn!(
+            scope = refusal.as_str(),
+            user_hash = %audit::identity_hash(&identity.user_id),
+            burst = rate_limit::MAX_INITIALIZES_PER_IDENTITY,
+            refill_seconds = session::SESSION_KEEP_ALIVE.as_secs(),
+            "refused MCP initialize: per-identity session quota exhausted"
+        );
         return (
             StatusCode::TOO_MANY_REQUESTS,
             "too many MCP initialize requests; try again later\n",

@@ -224,18 +224,54 @@ impl InitializeLimiter {
     }
 
     /// Check both per-bearer-hash and per-sub initialize buckets.
-    pub fn check(&self, bearer_hash: &str, sub: Option<&str>) -> Result<(), RateLimited> {
-        let bearer_bucket = get_or_insert_with_quota(&self.bearer, bearer_hash, self.quota)?;
+    ///
+    /// Returns *which* bucket refused. A refusal that says only "refused" is
+    /// the same object as the 429 that says only "later": it cannot separate
+    /// one token reconnecting from one identity rotating tokens, and neither
+    /// from the limiter's own bucket map filling, which is not a quota
+    /// refusal at all.
+    pub fn check(&self, bearer_hash: &str, sub: Option<&str>) -> Result<(), InitializeRefusal> {
+        let bearer_bucket = get_or_insert_with_quota(&self.bearer, bearer_hash, self.quota)
+            .map_err(|RateLimited| InitializeRefusal::BucketCapacity)?;
         if bearer_bucket.check().is_err() {
-            return Err(RateLimited);
+            return Err(InitializeRefusal::Bearer);
         }
         if let Some(s) = sub {
-            let sub_bucket = get_or_insert_with_quota(&self.sub, s, self.quota)?;
+            let sub_bucket = get_or_insert_with_quota(&self.sub, s, self.quota)
+                .map_err(|RateLimited| InitializeRefusal::BucketCapacity)?;
             if sub_bucket.check().is_err() {
-                return Err(RateLimited);
+                return Err(InitializeRefusal::Subject);
             }
         }
         Ok(())
+    }
+}
+
+/// Which bucket refused an `initialize`.
+///
+/// The three are different diagnoses and were previously one value. `Subject`
+/// is the shape a client minting a fresh token per session makes: every
+/// attempt gets a new bearer bucket and the same subject bucket, so the
+/// subject bucket is the one that runs out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitializeRefusal {
+    /// Per-bearer-token bucket empty: one token reconnecting.
+    Bearer,
+    /// Per-subject bucket empty: one identity across rotated tokens.
+    Subject,
+    /// The limiter's own bucket map is at `MAX_BUCKETS_PER_MAP`. Not a quota
+    /// refusal, and indistinguishable from one until now.
+    BucketCapacity,
+}
+
+impl InitializeRefusal {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bearer => "bearer",
+            Self::Subject => "subject",
+            Self::BucketCapacity => "bucket_capacity",
+        }
     }
 }
 
@@ -325,5 +361,44 @@ mod tests {
         get_or_insert_capped(&map, "two", quota, 2, Duration::from_secs(60)).unwrap();
         assert!(get_or_insert_capped(&map, "three", quota, 2, Duration::from_secs(60)).is_err());
         assert_eq!(map.read().unwrap().len(), 2);
+    }
+
+    /// One token reconnecting exhausts its own bucket, and the log line has to
+    /// say so: it is a different diagnosis from the same identity rotating
+    /// tokens and the two were previously one value.
+    #[test]
+    fn a_refusal_names_the_bearer_bucket() {
+        let l = InitializeLimiter::new(Duration::from_secs(60), 1);
+        l.check("same-token", Some("user")).unwrap();
+        assert_eq!(
+            l.check("same-token", Some("user")),
+            Err(InitializeRefusal::Bearer)
+        );
+    }
+
+    /// The shape of the incident this was written for: a client minting a
+    /// fresh token per session gets a new bearer bucket every time and the
+    /// same subject bucket, so the subject bucket is what runs out. A refusal
+    /// that cannot say `subject` cannot tell anyone that.
+    #[test]
+    fn a_refusal_names_the_subject_bucket() {
+        let l = InitializeLimiter::new(Duration::from_secs(60), 1);
+        l.check("token-one", Some("user")).unwrap();
+        assert_eq!(
+            l.check("token-two", Some("user")),
+            Err(InitializeRefusal::Subject),
+            "a fresh token must not be reported as its own bucket refusing"
+        );
+    }
+
+    #[test]
+    fn refusal_scopes_have_distinct_log_values() {
+        for (refusal, expected) in [
+            (InitializeRefusal::Bearer, "bearer"),
+            (InitializeRefusal::Subject, "subject"),
+            (InitializeRefusal::BucketCapacity, "bucket_capacity"),
+        ] {
+            assert_eq!(refusal.as_str(), expected);
+        }
     }
 }
