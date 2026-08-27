@@ -89,8 +89,26 @@ const DEFAULT_RATE_LIMIT_WRITES: u32 = 30;
 ///
 /// Being wrong is asymmetric and this errs the recoverable way: `parse_client_ip`
 /// returns `None` when the chain is shorter than the hop count, so 2 against a
-/// one-entry chain blanks the field. Too low does not blank it — it selects a
+/// one-entry chain blanks the field. Too low does not blank it: it selects a
 /// proxy and records a well-formed address identifying the wrong party.
+///
+/// **The value holds only while the edge replaces `X-Forwarded-For` rather than
+/// appending to it.** That is a property of `oddie-apps/edge-config`, not of
+/// this code, so this number and the edge's `trusted_proxies` setting have to
+/// be re-derived together. Reverse pointer: `oddie-apps/edge-config#39`.
+///
+/// **Residual, and the 109-request measurement could not see it.** A caller
+/// that reaches the Cilium gateway directly, bypassing the edge, supplies its
+/// own header; Envoy appends the caller's address, so the chain is two long,
+/// `len < hops` never fires, and two hops selects the string the caller wrote.
+/// **No single hop count is correct for both paths**: the edge path wants 2 and
+/// the direct path wants 1, so choosing either forges one of them. The
+/// mitigation is that only one path is supposed to exist, which is a fact about
+/// the cluster that nothing here can assert. The yield is a forged address in a
+/// provenance record rather than access, and it needs a stolen bearer first,
+/// but a confident wrong value reads as settled where a blank reads as unknown.
+/// Applies identically to `carddav-mcp`, `jmap-mcp` and `webmail`, because the
+/// residual is in the topology rather than in any implementation.
 const DEFAULT_TRUSTED_PROXY_HOPS: usize = 2;
 /// Fallback Logto RFC 8707 resource / Stalwart `requireAudience` when
 /// `CALDAV_MCP_STALWART_AUDIENCE` is unset: the MCP origin (`resource_url`).
