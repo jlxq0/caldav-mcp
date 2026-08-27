@@ -67,7 +67,31 @@ const ENV_STALWART_AUDIENCE: &str = "CALDAV_MCP_STALWART_AUDIENCE";
 
 const DEFAULT_RATE_LIMIT_READS: u32 = 60;
 const DEFAULT_RATE_LIMIT_WRITES: u32 = 30;
-const DEFAULT_TRUSTED_PROXY_HOPS: usize = 1;
+/// Proxies that append to `X-Forwarded-For` between a client and this pod.
+///
+/// **Two, and the topology is the reason rather than a product name.** The path
+/// is client → Caddy edge → Cilium gateway → pod: the edge configures no
+/// `trusted_proxies`, so it *replaces* the header with its peer (entry one, the
+/// client), and Cilium runs `gateway-api-xff-num-trusted-hops: 0`, so Envoy
+/// *appends* the downstream address (entry two, the edge). A constant encoding
+/// another system's behaviour is worthless without that system named beside
+/// it — a sibling service carried `Default 1 (Traefik)` and there is no Traefik
+/// on this cluster at all.
+///
+/// Measured at the pod on 2026-08-27: 109 authenticated requests over eleven
+/// hours, `xff_entries=2` on every one, and derived independently from
+/// `oddie-apps/edge-config` rather than from the same instrument.
+///
+/// **A deployment not behind that edge must override this.** The `home`
+/// gateway is LAN-only with no edge in front, so a backend there sees one
+/// entry, and a service moving between the two changes its own correct value
+/// with nothing reporting it.
+///
+/// Being wrong is asymmetric and this errs the recoverable way: `parse_client_ip`
+/// returns `None` when the chain is shorter than the hop count, so 2 against a
+/// one-entry chain blanks the field. Too low does not blank it — it selects a
+/// proxy and records a well-formed address identifying the wrong party.
+const DEFAULT_TRUSTED_PROXY_HOPS: usize = 2;
 /// Fallback Logto RFC 8707 resource / Stalwart `requireAudience` when
 /// `CALDAV_MCP_STALWART_AUDIENCE` is unset: the MCP origin (`resource_url`).
 /// Must be an absolute http(s) URI — never the bare string `stalwart`.
@@ -478,5 +502,24 @@ mod tests {
             resolve_metrics_bind_addr(None, None).unwrap().to_string(),
             "127.0.0.1:9090"
         );
+    }
+
+    /// The default is the deployed topology: client, Caddy edge, Cilium
+    /// gateway, pod. Two entries reach us, so two hops selects the one the
+    /// edge wrote. At 1 the recorded client IP is the edge's, a well-formed
+    /// address for the wrong party, which is worse than the blank field a
+    /// wrong-but-too-high value produces.
+    #[test]
+    fn trusted_proxy_hops_defaults_to_the_deployed_chain_length() {
+        assert_eq!(cfg().trusted_proxy_hops, 2);
+    }
+
+    /// The burst and refill are the numbers a user meets, so pin them rather
+    /// than trusting that nobody edits a constant.
+    #[test]
+    fn initialize_quota_defaults_are_the_shipped_ones() {
+        let c = cfg();
+        assert_eq!(c.initialize_burst, 24);
+        assert_eq!(c.initialize_refill, Duration::from_secs(60));
     }
 }

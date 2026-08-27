@@ -293,4 +293,32 @@ mod tests {
             2
         );
     }
+
+    /// Being wrong is asymmetric, so the default errs toward the blank field.
+    /// A chain shorter than the hop count yields `None` rather than reaching
+    /// for whatever entry is there.
+    #[test]
+    fn a_chain_shorter_than_the_hop_count_blanks_rather_than_guesses() {
+        assert_eq!(parse_client_ip(Some("203.0.113.5"), 2), None);
+        assert_eq!(parse_client_ip(None, 2), None);
+    }
+
+    /// The deployed topology: client, then the edge, then the gateway appends.
+    /// Two hops selects the entry the edge wrote, which is the client. One hop
+    /// selects the edge itself and records it as the client, which is the
+    /// failure this default exists to avoid.
+    #[test]
+    fn two_hops_selects_the_client_and_one_hop_selects_the_edge() {
+        let chain = Some("203.0.113.5, 198.51.100.7");
+        assert_eq!(
+            parse_client_ip(chain, 2),
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))),
+            "two hops must select the entry the edge wrote"
+        );
+        assert_eq!(
+            parse_client_ip(chain, 1),
+            Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))),
+            "one hop selects the edge: a well-formed address for the wrong party"
+        );
+    }
 }

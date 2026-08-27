@@ -282,3 +282,23 @@ cargo test --all-features --locked
   the work. `cargo` is the job that runs the gates: `fmt --check`, `clippy -D
   warnings`, `test --all-features --locked`, `audit`, and `deny`. Do not add
   `docker` to the required list while it depends on `cargo`.
+- **`CALDAV_MCP_TRUSTED_PROXY_HOPS` is 2 here, and the topology is the reason
+  rather than a product name.** Client → Caddy edge → Cilium gateway → pod: the
+  edge configures no `trusted_proxies`, so it *replaces* `X-Forwarded-For` with
+  its peer, and Cilium runs `gateway-api-xff-num-trusted-hops: 0`, so Envoy
+  *appends* the downstream address. Two entries reach the pod, measured 109
+  times out of 109 over eleven hours on 2026-08-27 and derived independently
+  from `oddie-apps/edge-config`. A sibling service documented its own value as
+  `Default 1 (Traefik)` and there is no Traefik on this cluster at all, which is
+  what a constant encoding another system's behaviour looks like when the system
+  is not named beside it.
+
+  **A deployment not behind that edge must override.** The `home` gateway is
+  LAN-only, so a backend there sees one entry, and a service moving between the
+  two changes its own correct value with nothing reporting it.
+
+  **Being wrong is asymmetric, and the default errs the recoverable way.**
+  `parse_client_ip` returns `None` when the chain is shorter than the hop count,
+  so too high blanks the field. Too low does not: it selects a proxy and writes
+  a well-formed address identifying the wrong party into the provenance record,
+  which is the value an incident acts on.
