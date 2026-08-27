@@ -246,15 +246,30 @@ cargo test --all-features --locked
   never scheduled.** `docker` declares `needs: cargo`, so when `cargo` fails,
   `docker` never runs and **no task is ever created for it** under
   `/actions/tasks`. Its status sits at `pending` for a long and unpredictable
-  interval before the server resolves it. Measured on `287a005c`: `cargo`
-  failed at `15:26:25Z`, `docker` stayed `pending` for **34 minutes** and
-  resolved to `failure` at `16:00:54Z`, having never been scheduled. It is not
-  permanent, which an earlier version of this entry claimed; it is long enough
-  to be indistinguishable from a job queued behind the capacity-1 runner, and
-  it cost fifty minutes of waiting out of a correct reluctance to push and
-  cancel an in-flight run. Before waiting on a `pending` status, check whether
-  a task exists for that sha **and** whether the job it declares `needs:` on
-  passed. Either alone is ambiguous; together they are decisive.
+  interval before the server resolves it. Measured on `287a005c`, which has
+  exactly two `docker` rows:
+
+      15:11:32Z  CI / docker (pull_request)  pending
+      16:00:54Z  CI / docker (pull_request)  failure
+
+  **49 minutes in `pending`**, of which 34 were after `cargo` failed at
+  `15:26:25Z`. Not permanent, which one version of this entry claimed, and not
+  34 minutes, which the next one did: that figure was the delay after the
+  dependency failed rather than the time spent pending. Long enough either way
+  to be indistinguishable from a job queued behind the capacity-1 runner, which
+  cost fifty minutes of waiting out of a correct reluctance to push and cancel
+  an in-flight run. Before waiting on a `pending` status, check whether a task
+  exists for that sha **and** whether the job it declares `needs:` on passed.
+  Either alone is ambiguous; together they are decisive.
+- **Read `/commits/{sha}/status`, not `/commits/{sha}/statuses`.** The plural
+  endpoint returns every row ever written, and Forgejo's timestamps are
+  second-resolution, so a job that skips writes `pending` and `success` in the
+  same second and any reduction that picks one of a tie picks arbitrarily. Four
+  repositories reported stranded `pending` statuses that way on 2026-08-26 and
+  every one collapsed on the combined endpoint, which dedupes. The case above
+  survives because its two rows are 49 minutes apart rather than tied, which is
+  a property of the data and not of the reduction, and the combined endpoint
+  returns the same answer for it.
 - **`main` is protected: no direct pushes, `CI / cargo*` required, zero
   approvals.** The glob covers both event suffixes, `(push)` on a branch push
   and `(pull_request)` on a pull-request head, which are different contexts for
