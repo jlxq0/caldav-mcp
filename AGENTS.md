@@ -302,3 +302,23 @@ cargo test --all-features --locked
   so too high blanks the field. Too low does not: it selects a proxy and writes
   a well-formed address identifying the wrong party into the provenance record,
   which is the value an incident acts on.
+
+  **2 is safe only because the edge replaces the header rather than appending
+  to it**, and that is a property of `oddie-apps/edge-config` rather than of
+  this code. Caddy sets `trusted_proxies` nowhere, in the global block or in any
+  of its 80 site blocks, so no client-supplied entry survives into the chain.
+  Behind an *appending* proxy the same value would be dangerous rather than
+  merely wrong: `len < hops` would never fire, and counting two in from the
+  right would land on whatever the client sent. **Do not raise a hop count
+  elsewhere by analogy with this one.** The trade is deliberate: at 0 this
+  service's correctness did not depend on the edge at all, because it selected
+  nothing whatever the header said; at 2 it has a real audit trail and depends
+  on the edge continuing to replace. The reverse pointer is
+  `oddie-apps/edge-config#39`.
+
+  **The log line reports whether an address resolved, never the address.** So
+  the acceptance for a hop-count change is the three fields together —
+  `xff_entries`, `trusted_proxy_hops` and `client_ip_resolved` — from which the
+  selected index is `entries - hops`. `resolved=true` alone does not
+  distinguish 2 from 1, since both resolve; it distinguishes either from the
+  blank that 0 produces.
