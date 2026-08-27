@@ -331,8 +331,20 @@ cargo test --all-features --locked
   reading, that the public addresses shift the burden and one vantage cannot
   settle it, was the honest disposal of a weaker measurement and is superseded
   by this one. **The one line that would change it is a second `parentRef` on an
-  HTTPRoute**; all eight name `gateway/web` today, and that assertion belongs in
-  `platform` as a manifest property rather than here.
+  HTTPRoute**; enumerated cluster-wide on 2026-08-27, 89 routes with none
+  carrying more than one, so the property is unanimous rather than merely true
+  of this service's eight, and the assertion belongs in `platform` as a manifest
+  property rather than here. **Being on the edge-only list is not a statement
+  that this hop count is right, and fixing this hop count is not a reason to
+  come off it**: the list is about which routes must stay edge-only, and the two
+  facts are independent despite being established in the same hour.
+
+  **And "the pod" is two pods.** Production and beta run separate images from
+  separate tags under separate manifests, so a measurement or a default reaching
+  one says nothing about the other. On 2026-08-27 production ran `v0.2.2` with
+  the corrected default while beta still ran a `v0.2.0-beta` image with the old
+  one, which would have made deleting beta's override inherit 1 while deleting
+  production's was safe.
 
   **And on that path the severity inverts.** 1 selects an infrastructure
   address, 2 selects whatever the caller typed, so the value that fixes the

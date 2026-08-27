@@ -109,7 +109,14 @@ const DEFAULT_RATE_LIMIT_WRITES: u32 = 30;
 /// 2026-08-27, the gateway's addresses time out from the LAN and answer 401
 /// from a pod, because the `MetalLB` pool holding them is BGP-advertised rather
 /// than L2. The one line that would change it is a second `parentRef` on an
-/// `HTTPRoute`; all eight name `gateway/web` today.
+/// `HTTPRoute`. Enumerated cluster-wide on 2026-08-27: 89 routes, none with
+/// more than one `parentRef`, so the property is unanimous rather than merely
+/// true of this service's eight.
+///
+/// **Being on the edge-only list is not a statement that this hop count is
+/// right, and fixing this hop count is not a reason to come off it.** The list
+/// is about which routes must stay edge-only; the two facts are independent
+/// and were only established in the same hour.
 ///
 /// **And the severity is asymmetric in the other direction there.** On a path
 /// that skips the edge, 1 selects an infrastructure address and 2 selects
