@@ -242,11 +242,28 @@ cargo test --all-features --locked
   can be observed from outside the MCP router. Per-identity counts go in the
   log line as `user_hash`, never as a metric label, where a hash is unbounded
   cardinality.
-- **A `pending` commit status on the `docker` context can mean it will never
-  run.** `docker` declares `needs: cargo`, so when `cargo` fails, `docker` is
-  never scheduled and its status stays `pending` indefinitely. No task appears
-  for it under `/actions/tasks` at all. That is indistinguishable from a job
-  queued behind the capacity-1 runner, and on 2026-08-26 it cost fifty minutes
-  of waiting for a job that could not start, out of a correct reluctance to
-  push and cancel an in-flight run. Before waiting on a `pending` status, check
-  whether a task for that sha exists and whether the job it depends on passed.
+- **A `pending` commit status on the `docker` context can mean the job was
+  never scheduled.** `docker` declares `needs: cargo`, so when `cargo` fails,
+  `docker` never runs and **no task is ever created for it** under
+  `/actions/tasks`. Its status sits at `pending` for a long and unpredictable
+  interval before the server resolves it. Measured on `287a005c`: `cargo`
+  failed at `15:26:25Z`, `docker` stayed `pending` for **34 minutes** and
+  resolved to `failure` at `16:00:54Z`, having never been scheduled. It is not
+  permanent, which an earlier version of this entry claimed; it is long enough
+  to be indistinguishable from a job queued behind the capacity-1 runner, and
+  it cost fifty minutes of waiting out of a correct reluctance to push and
+  cancel an in-flight run. Before waiting on a `pending` status, check whether
+  a task exists for that sha **and** whether the job it declares `needs:` on
+  passed. Either alone is ambiguous; together they are decisive.
+- **`main` is protected: no direct pushes, `CI / cargo*` required, zero
+  approvals.** The glob covers both event suffixes, `(push)` on a branch push
+  and `(pull_request)` on a pull-request head, which are different contexts for
+  the same job.
+
+  **`CI / docker` is deliberately not required**, and the reason is not that it
+  is unimportant. Its status is *derived* from `cargo` through `needs:`, so it
+  carries no information `cargo` does not already carry, and it resolves up to
+  half an hour late (above), which would gate every merge on a status that lags
+  the work. `cargo` is the job that runs the gates: `fmt --check`, `clippy -D
+  warnings`, `test --all-features --locked`, `audit`, and `deny`. Do not add
+  `docker` to the required list while it depends on `cargo`.
