@@ -321,4 +321,28 @@ mod tests {
             "one hop selects the edge: a well-formed address for the wrong party"
         );
     }
+
+    /// The residual the deployed measurement could not see, pinned so it is
+    /// visible in the code rather than only in a comment.
+    ///
+    /// A caller reaching the Cilium gateway directly supplies its own header
+    /// and Envoy appends its address, so the chain is two long and the guard
+    /// never fires. **Two hops then selects the caller's own string.** One hop,
+    /// which is the correct value for that path, selects the address Envoy
+    /// appended. No single value is right for both paths; the mitigation is
+    /// that only one path exists, which is a fact about the cluster.
+    #[test]
+    fn a_direct_caller_bypassing_the_edge_can_forge_the_recorded_address() {
+        let forged = Some("9.9.9.9, 198.51.100.7");
+        assert_eq!(
+            parse_client_ip(forged, 2),
+            Some(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))),
+            "two hops takes the caller's own claim when the edge was bypassed"
+        );
+        assert_eq!(
+            parse_client_ip(forged, 1),
+            Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))),
+            "one hop is correct for the direct path and wrong for the edge path"
+        );
+    }
 }
