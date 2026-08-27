@@ -360,3 +360,26 @@ cargo test --all-features --locked
   selected index is `entries - hops`. `resolved=true` alone does not
   distinguish 2 from 1, since both resolve; it distinguishes either from the
   blank that 0 produces.
+- **An image tag minted by the beta loop is not a git ref.** `bin/ci-version`
+  names the *container image*; nothing tags the repository. So
+  `v0.2.3-beta.20260827043744` exists in the registry and not in
+  `git ls-remote --tags`, and a contents lookup at that ref correctly reports
+  `object does not exist`. A beta build's source is reachable through the
+  `sha-<short>` image tag or through `/health`'s `revision`, never through the
+  version its image was published under. The one exception is
+  `v0.1.2-beta.20260826052605`, cut by hand before the loop existed.
+- **`/repos/{r}/tags/{name}` is not an existence check, because its miss echoes
+  your input.** A name it cannot find returns `{"message": "<the name you
+  asked>"}`, and a name it finds returns `{"name": "<the tag>", ...}`. A
+  fabricated string produces the identical shape, so any reduction that greps
+  the response for the tag name reports every tag as present. Measured
+  2026-08-27:
+
+      v0.2.3-beta.20260827043744  ->  {"message": "v0.2.3-beta.20260827043744"}
+      definitely-not-a-tag        ->  {"message": "definitely-not-a-tag"}
+      v0.2.2                      ->  {"name": "v0.2.2", ...}
+
+  Check `git ls-remote --tags` or read `.name` specifically, and resolve a
+  file lookup by sha when the answer is load-bearing. This corrected a report
+  that the contents API silently fails on tags: it does not, stable tags
+  resolve, and the endpoint that lies is the one that looked like corroboration.
