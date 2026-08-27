@@ -4,6 +4,19 @@ This project follows semantic versioning while it is pre-1.0. This file and the
 signed `vX.Y.Z` tags are the release record; Forgejo release objects are not
 maintained, so their absence says nothing about whether a version shipped.
 
+## 0.2.2 - 2026-08-27
+
+### Fixed
+
+- `CALDAV_MCP_TRUSTED_PROXY_HOPS` defaults to 2 rather than 1, which is the
+  measured length of the chain reaching the pod: client, Caddy edge, Cilium
+  gateway. 109 authenticated requests over eleven hours carried two entries,
+  and the same conclusion follows independently from the edge configuration.
+  At 1 the recorded client address is the gateway's, a well-formed value
+  identifying the wrong party in a provenance field; at 2 against a shorter
+  chain the field is left blank instead. A deployment not behind that edge must
+  override, since a LAN-only gateway appends nothing.
+
 ## 0.2.1 - 2026-08-26
 
 ### Added
