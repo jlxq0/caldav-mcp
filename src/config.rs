@@ -104,9 +104,19 @@ const DEFAULT_RATE_LIMIT_WRITES: u32 = 30;
 /// **No single hop count is correct for both paths**: the edge path wants 2 and
 /// the direct path wants 1, so choosing either forges one of them. The
 /// mitigation is that only one path is supposed to exist, which is a fact about
-/// the cluster that nothing here can assert. The yield is a forged address in a
-/// provenance record rather than access, and it needs a stolen bearer first,
-/// but a confident wrong value reads as settled where a blank reads as unknown.
+/// the cluster that nothing here can assert. **The precondition is a stolen
+/// bearer plus code running inside the cluster**, not LAN access: measured
+/// 2026-08-27, the gateway's addresses time out from the LAN and answer 401
+/// from a pod, because the `MetalLB` pool holding them is BGP-advertised rather
+/// than L2. The one line that would change it is a second `parentRef` on an
+/// `HTTPRoute`; all eight name `gateway/web` today.
+///
+/// **And the severity is asymmetric in the other direction there.** On a path
+/// that skips the edge, 1 selects an infrastructure address and 2 selects
+/// whatever the caller typed, so the value that fixes the ordinary path is the
+/// one that turns a wrong-but-inert record into a caller-controlled one. "Set
+/// it to the edge-inclusive depth" reads as a complete instruction and is not.
+/// A confident wrong value reads as settled where a blank reads as unknown.
 /// Applies identically to `carddav-mcp`, `jmap-mcp` and `webmail`, because the
 /// residual is in the topology rather than in any implementation.
 const DEFAULT_TRUSTED_PROXY_HOPS: usize = 2;
@@ -539,5 +549,22 @@ mod tests {
         let c = cfg();
         assert_eq!(c.initialize_burst, 24);
         assert_eq!(c.initialize_refill, Duration::from_secs(60));
+    }
+
+    /// The consequence rather than the number. Feeding the shipped default the
+    /// chain the deployment actually receives must select the entry the edge
+    /// wrote. Asserting `== 2` alone is a tautology on the constant; this fails
+    /// in both directions, because 1 selects the gateway and 3 blanks the
+    /// field.
+    #[test]
+    fn the_default_selects_the_edge_written_entry_on_the_deployed_chain() {
+        use crate::last_used::parse_client_ip;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let deployed_chain = Some("203.0.113.5, 198.51.100.7");
+        assert_eq!(
+            parse_client_ip(deployed_chain, cfg().trusted_proxy_hops),
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)))
+        );
     }
 }

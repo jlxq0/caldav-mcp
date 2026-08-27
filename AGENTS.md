@@ -323,14 +323,22 @@ cargo test --all-features --locked
   wrote. **No single hop count is correct for both paths**: the edge path wants
   2 and the direct path wants 1. The mitigation is that only one path is
   supposed to exist, which is a fact about the cluster that nothing in this
-  repository can assert. Measured from here on 2026-08-27 and **not
-  conclusive**: `cilium-gateway-web` is a `LoadBalancer` holding public
-  addresses `203.24.209.5` and `2001:df7:2b40:1::102` with a single `HTTP:80`
-  listener and no TLS, and `203.24.209.5:80` did not answer from this machine
-  (`curl` exit code, no HTTP status). One vantage and one moment cannot separate
-  filtered from unrouted, and an HTTPS-upgrading fetcher cannot probe it from
-  off-net at all because there is no TLS listener to reach. The addresses being
-  public shifts the burden; it does not settle it. Applies identically to
+  repository can assert. **Measured 2026-08-27: the precondition is a stolen
+  bearer plus code running inside the cluster, not LAN access.** The gateway's
+  addresses time out from the LAN on 80 and 443 and answer 401 from a pod,
+  because the `MetalLB` pool holding them is BGP-advertised across `sgp`, `lax`
+  and `zrh` rather than L2, so nothing on the wifi has a route. My own earlier
+  reading, that the public addresses shift the burden and one vantage cannot
+  settle it, was the honest disposal of a weaker measurement and is superseded
+  by this one. **The one line that would change it is a second `parentRef` on an
+  HTTPRoute**; all eight name `gateway/web` today, and that assertion belongs in
+  `platform` as a manifest property rather than here.
+
+  **And on that path the severity inverts.** 1 selects an infrastructure
+  address, 2 selects whatever the caller typed, so the value that fixes the
+  ordinary path is the one that turns a wrong-but-inert record into a
+  caller-controlled one. "Set it to the edge-inclusive depth" reads as a
+  complete instruction and is not. Applies identically to
   `carddav-mcp`, `jmap-mcp` and `webmail`, because the residual is in the
   topology rather than in any implementation.
 
