@@ -383,3 +383,28 @@ cargo test --all-features --locked
   file lookup by sha when the answer is load-bearing. This corrected a report
   that the contents API silently fails on tags: it does not, stable tags
   resolve, and the endpoint that lies is the one that looked like corroboration.
+- **`ATTENDEE` without `ORGANIZER` invites nobody, and every signal says it
+  worked.** RFC 6638 scheduling keys on `ORGANIZER`, so an object carrying
+  attendees and no organizer is not a scheduling object and the server
+  correctly emits no iTIP. The event appears on the calendar, `list_events`
+  returns the attendee, and the create response echoes `attendees: [...]`
+  beside `organizer: null`. `create_event` shipped that way and 360 log lines
+  with zero scheduling events, measured with a control, is what found it.
+
+  **The obvious test cannot catch it**: asserting on `create_event`'s response
+  passes against the broken code, because the response is built from the same
+  struct that omitted the field. Assert on the **stored object**, and prove it
+  by removing the `ORGANIZER` line and watching the suite stay green, which it
+  did at 124 passed.
+
+  `ORGANIZER` is written only when there are attendees. Writing it on a solo
+  event would make everything this tool creates a scheduling object, changing
+  what later edits do rather than fixing what this one does. And attendees with
+  no organizer available are **refused**, because a token carrying no email
+  claim would otherwise recreate the original defect silently.
+
+  **An update carries `ORGANIZER` through and does not add one.** So a series
+  created after this fix notifies on edit and on attendee removal, and one
+  created before it still notifies nobody. Backfilling on update would start
+  sending mail about events that have never notified anyone, which is the
+  irrecoverable direction, so it is deliberately not done.

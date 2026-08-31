@@ -565,6 +565,10 @@ impl CaldavMcpService {
                     &token.0,
                     &params.calendar_href,
                     &NewEvent {
+                        // The authenticated principal. Without it an event
+                        // carrying ATTENDEE is not a scheduling object and
+                        // invites nobody, while every signal says it worked.
+                        organizer: identity.as_ref().and_then(|value| value.email.clone()),
                         summary: params.summary,
                         start: params.start,
                         end: params.end,

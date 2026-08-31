@@ -152,6 +152,15 @@ pub struct BusyInterval {
 
 #[derive(Clone, Debug)]
 pub struct NewEvent {
+    /// The authenticated principal, written as `ORGANIZER` when the event has
+    /// attendees.
+    ///
+    /// RFC 6638 scheduling keys on `ORGANIZER`: an object carrying `ATTENDEE`
+    /// and no `ORGANIZER` is not a scheduling object, so Stalwart correctly
+    /// generates no iTIP and the event invites nobody. Every signal after the
+    /// write says it worked, which is why this is a field rather than a
+    /// convention.
+    pub organizer: Option<String>,
     pub summary: String,
     pub start: String,
     pub end: String,
@@ -1127,6 +1136,27 @@ fn build_new_ics(uid: &str, event: &NewEvent) -> Result<String, CaldavError> {
     if let Some(location) = &event.location {
         lines.push(format!("LOCATION:{}", escape_ical(location)));
     }
+    if !event.attendees.is_empty() {
+        // Only when there are attendees. Writing `ORGANIZER` on a solo event
+        // would make every event this tool creates a scheduling object in
+        // Stalwart's eyes, which changes what later edits do rather than
+        // fixing what this one does.
+        let organizer = event
+            .organizer
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CaldavError::InvalidInput(
+                    "cannot invite attendees without an organizer: the authenticated token \
+                     carries no email claim, and an event with ATTENDEE and no ORGANIZER is not \
+                     a scheduling object, so it would be created having invited nobody"
+                        .to_owned(),
+                )
+            })?;
+        validate_attendee(organizer)?;
+        lines.push(format!("ORGANIZER:mailto:{}", escape_ical(organizer)));
+    }
     for attendee in &event.attendees {
         validate_attendee(attendee)?;
         lines.push(format!("ATTENDEE:mailto:{}", escape_ical(attendee)));
@@ -1736,6 +1766,7 @@ mod tests {
     #[test]
     fn new_all_day_event_uses_exclusive_date_end() {
         let event = NewEvent {
+            organizer: None,
             summary: "National Day".to_owned(),
             start: "2026-08-09".to_owned(),
             end: "2026-08-10".to_owned(),
@@ -1895,6 +1926,7 @@ mod tests {
                 "per-user-token",
                 "/dav/cal/u/default/",
                 &NewEvent {
+                    organizer: None,
                     summary: "Planning".to_owned(),
                     start: "2026-08-18T09:00:00".to_owned(),
                     end: "2026-08-18T10:00:00".to_owned(),
@@ -2228,5 +2260,134 @@ mod tests {
         // RECURRENCE-ID, not the start.
         assert_ne!(moved.recurrence_id_value, moved.start);
         server.verify().await;
+    }
+
+    fn invited_event(organizer: Option<&str>) -> NewEvent {
+        NewEvent {
+            organizer: organizer.map(ToOwned::to_owned),
+            summary: "Planning".to_owned(),
+            start: "2026-09-01T09:00:00".to_owned(),
+            end: "2026-09-01T10:00:00".to_owned(),
+            timezone: "Asia/Singapore".to_owned(),
+            description: None,
+            location: None,
+            attendees: vec!["lucy@kampong.social".to_owned()],
+            recurrence_rule: None,
+        }
+    }
+
+    /// **The assertion is on the stored object, not on the response.** An
+    /// event carrying `ATTENDEE` and no `ORGANIZER` is not a scheduling object
+    /// under RFC 6638, so the server generates no iTIP and it invites nobody,
+    /// while the response still echoes the attendee back. Asserting on what
+    /// `create_event` returns passes either way, because the response is built
+    /// from the same struct that omitted the field.
+    #[test]
+    fn an_event_with_attendees_carries_an_organizer_in_the_stored_object() {
+        let ics = build_new_ics("uid-1", &invited_event(Some("julian@kampong.social"))).unwrap();
+        assert!(
+            ics.contains("ORGANIZER:mailto:julian@kampong.social"),
+            "stored object must carry ORGANIZER, got:\n{ics}"
+        );
+
+        // And it must survive the read path, since an ORGANIZER the parser
+        // drops is the same defect one layer over.
+        let parsed = parse_ical_event(&ics, "/c/e.ics").unwrap();
+        assert_eq!(parsed.organizer.as_deref(), Some("julian@kampong.social"));
+        assert_eq!(parsed.attendees, vec!["lucy@kampong.social"]);
+    }
+
+    /// A solo event stays a plain event. Writing `ORGANIZER` unconditionally
+    /// would make everything this tool creates a scheduling object, which
+    /// changes what later edits do rather than fixing what this one does.
+    #[test]
+    fn an_event_without_attendees_has_no_organizer() {
+        let mut event = invited_event(Some("julian@kampong.social"));
+        event.attendees.clear();
+        let ics = build_new_ics("uid-2", &event).unwrap();
+        assert!(!ics.contains("ORGANIZER"), "got:\n{ics}");
+    }
+
+    /// No email claim on the token means no valid organizer, and the failure
+    /// this refuses is the silent one: an event created having invited nobody,
+    /// reporting success, with the attendee echoed back.
+    #[test]
+    fn attendees_without_an_organizer_are_refused_rather_than_written() {
+        for organizer in [None, Some(""), Some("   ")] {
+            let error = build_new_ics("uid-3", &invited_event(organizer)).unwrap_err();
+            assert!(
+                error.to_string().contains("invited nobody"),
+                "unexpected error for {organizer:?}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_event_puts_an_organizer_when_there_are_attendees() {
+        let server = MockServer::start().await;
+        Mock::given(method("PROPFIND"))
+            .respond_with(ResponseTemplate::new(207).set_body_string(
+                r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>/dav/cal/u/default/</d:href><d:propstat><d:prop><d:current-user-principal><d:href>/dav/principals/u/</d:href></d:current-user-principal><c:calendar-home-set><d:href>/dav/cal/u/</d:href></c:calendar-home-set></d:prop></d:propstat></d:response></d:multistatus>"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/dav/cal/u/default/.*\.ics$"))
+            .and(body_string_contains(
+                "ORGANIZER:mailto:julian@kampong.social",
+            ))
+            .and(body_string_contains("ATTENDEE:mailto:lucy@kampong.social"))
+            .respond_with(ResponseTemplate::new(201).insert_header("etag", "\"v1\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = CaldavClient::new(&server.uri(), None).unwrap();
+
+        client
+            .create_event(
+                "token",
+                "/dav/cal/u/default/",
+                &invited_event(Some("julian@kampong.social")),
+            )
+            .await
+            .unwrap();
+
+        // wiremock fails verification on an unmatched request, so a PUT whose
+        // body lacks ORGANIZER surfaces here rather than passing quietly.
+        server.verify().await;
+    }
+
+    /// Answers half of "does updating an event with attendees notify them".
+    /// It does, for an event this tool created after the fix, because the
+    /// patch edits the master in place and passes `ORGANIZER` through, so the
+    /// object stays a scheduling object and the server's organizer diff fires.
+    /// For an event created *before* the fix there is no `ORGANIZER` to carry
+    /// and the update still notifies nobody; backfilling one here would start
+    /// sending mail about events that have never notified anyone, which is the
+    /// irrecoverable direction, so it is deliberately not done.
+    #[test]
+    fn an_update_carries_the_organizer_through() {
+        let ics = build_new_ics("uid-4", &invited_event(Some("julian@kampong.social"))).unwrap();
+        let patch = EventPatch {
+            summary: Some("Renamed".to_owned()),
+            ..Default::default()
+        };
+        let patched = patch_ics(&ics, &patch).unwrap();
+        assert!(patched.contains("ORGANIZER:mailto:julian@kampong.social"));
+        assert!(patched.contains("SUMMARY:Renamed"));
+
+        // And an object that never had one does not acquire one by being
+        // edited.
+        let unscheduled = concat!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:old\r\nSUMMARY:Legacy\r\n",
+            "DTSTART:20260901T010000Z\r\nDTEND:20260901T020000Z\r\n",
+            "ATTENDEE:mailto:lucy@kampong.social\r\n",
+            "END:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+        let patched = patch_ics(unscheduled, &patch).unwrap();
+        assert!(
+            !patched.contains("ORGANIZER"),
+            "an update must not silently turn a quiet event into one that mails people"
+        );
     }
 }
