@@ -446,7 +446,17 @@ cargo test --all-features --locked
   `SCHEDULE-AGENT=CLIENT`, which is persistent data that also silences every
   later legitimate update. So a write that would schedule refuses by default
   and names every `ATTENDEE`, and the caller opts in per call. Verified against
-  `stalwartlabs/stalwart:v0.16.14`, the deployed image.
+  `v0.16.14` on 2026-08-26 and re-verified unchanged at `v0.16.19` on
+  2026-09-02 after the server was upgraded: `no_schedule_reply` is still read
+  in `delete.rs` and nowhere else, with `update.rs` and `copy_move.rs` at zero
+  occurrences.
+
+  **A version cited in a finding is a claim that expires when the deployment
+  moves**, and nothing reports the expiry. This one was written as "the
+  deployed image" and stopped being that overnight while still reading as
+  current. Cite the version *and* the date, and re-check at the running tag
+  before relying on it, which is `docker manifest inspect -v` against the pod's
+  `imageID` and then the same lines fetched at that tag rather than at `main`.
 - Assume every `ATTENDEE` is mailed. `send_update_messages()` skips an attendee
   only when `email.is_local`, and `Email::new` sets that by exact membership of
   `local_addresses` — which `build_account_info` fills with the **authenticated
@@ -454,7 +464,9 @@ cargo test --all-features --locked
   names, not with the domains the server hosts. `is_local_domain()` exists and
   is not what this uses. So a second mailbox on the same Stalwart is *not* local
   to the acting account and does receive an iMIP; the only address suppressed is
-  the caller's own. Read this before designing any experiment that puts an
+  the caller's own. Re-verified unchanged at `v0.16.19` on 2026-09-02:
+  `send_update_messages` still requires `!self.email.is_local` and `Email::new`
+  still sets it by exact membership. Read this before designing any experiment that puts an
   `ATTENDEE` in a fixture: expecting no mail for a same-server attendee makes a
   correct run look like a bug.
 - An `EXDATE` must match the occurrence as the `RRULE` generates it: same value
