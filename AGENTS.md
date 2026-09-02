@@ -437,6 +437,57 @@ cargo test --all-features --locked
   **Unmeasured**: the live `PROPFIND`. All of the above reads the code that
   serves it, blocked on the CalDAV credential that `#16` and `#19` also wait
   on.
+- **`AGENTS.md` sits outside every gate, so a bad conflict resolution ships
+  green.** On 2026-09-02 a rebase of `#19` produced a file with **three copies
+  of each of three entries**, and `fmt --check`, `clippy -D warnings`, 139 tests,
+  `audit` and `deny` all passed, because none of them reads markdown. It was
+  caught by a stray `|||||||` marker surviving into the commit, which is luck
+  rather than a check.
+
+  **Two causes worth knowing.** A scripted resolver that handles
+  `<<<<<<<`/`=======`/`>>>>>>>` silently mangles a **diff3** conflict, whose
+  extra `||||||| ` base section it treats as content. And when both sides of an
+  additive conflict end mid-item, concatenating them drops the delimiter that
+  the shared trailing context was supplying — in Rust that is a missing `}` and
+  the compiler says so, in markdown nothing does.
+
+  **The control, which costs one command.** These conflicts are additive, so the
+  resolved file must be `main`'s file plus the branch's added block, exactly:
+
+      diff <(head -<N> AGENTS.md) <(git show origin/main:AGENTS.md)   # must be empty
+      grep -c "<the entry's first line>" AGENTS.md                     # must be 1
+
+  Rebuild it that way rather than resolving in place, and never iterate on a
+  damaged resolution: reset and redo it, because each pass adds a copy.
+- **A claim that arrives flagged as an inference and leaves unflagged has been
+  laundered by the retelling.** On 2026-08-26 a peer gave me a reading of a 401
+  with the inference explicitly marked: *"the error names the credential type
+  and the dispatch file, so I am reasoning from the message rather than from the
+  source."* I adopted it as fact and repeated it in an issue, a pull request
+  body and three messages. **The marking did not survive the first retelling**,
+  and for six days every reader after me saw a measurement.
+
+  The fleet already has this for numbers crossing a session boundary. It is the
+  same shape for a *reading*: carry the marking with the claim, or do not carry
+  the claim.
+
+- **Re-running a measurement is not the same as testing it.** That 401 is
+  returned both by "this directory cannot hold passwords" and by "this principal
+  has none", and I re-measured it repeatedly and reported the repetition as
+  diligence. **A negative re-run carefully is still a negative from an
+  instrument with one answer.** What settled it was a different population
+  entirely: 6 of 26 principals on that directory carry a credential, and
+  non-human probe accounts with passwords already existed on it. The fixtures
+  were not missing accounts, they were missing one field.
+
+  Before re-running a negative, ask what result would have distinguished the two
+  explanations. If the instrument cannot produce it, change instruments.
+
+- **A blocker outside this repository is handed up, named, on the day it is
+  found.** Waiting on it is only correct once somebody has been asked. The
+  `blocked` label makes a hold visible and does **not** route it, so a PR can
+  sit correctly labelled and still be waiting on a question nobody has received.
+  Two failures, two fixes: label it *and* name the owner.
 - There is no way to make a `PUT` quiet. Stalwart parses `Schedule-Reply: F`
   (`crates/dav-proto/src/parser/header.rs`) but consults it only in
   `crates/dav/src/calendar/delete.rs`; `update.rs` never reads it. Every
@@ -494,3 +545,22 @@ cargo test --all-features --locked
   excludes nothing, which is a write that reports success and changes what the
   calendar shows not at all. Remove the matching override in the same `PUT`, or
   clients render an occurrence the series says does not exist.
+- **When a measurement changes what the server does, re-check every assumption
+  that rested on the old model, not only the ones you put on trial.** Learning
+  that Stalwart matches an `EXDATE` by **instant** retired two refusals I had
+  pre-registered. It also invalidated a third thing I had not questioned: the
+  idempotency check compared `EXDATE` **values** and ignored the zone, so
+  `EXDATE;TZID=UTC:20260908T090000` counted as already excluding the 09:00
+  Singapore occurrence. It does not, and the consequence was worse than a
+  redundant write: the exclusion was skipped, the override was still removed,
+  and the occurrence reappeared while the call reported success.
+
+  Found by cross-engine review of the change, asked as *can this new code do the
+  wrong thing in the case it was written for*. The same review found
+  `remove_override` stopping at the first match, so duplicate overrides left one
+  orphaned by the new `EXDATE` and a later read reported the occurrence the
+  deletion claimed to remove. **Accepting invalid input and preserving the
+  contradictory half of it is the wrong direction for a deletion tool.**
+
+  Both are the repair carrying a defect of the family it repaired, which is why
+  that question is asked of the diff and not of the code it fixes.

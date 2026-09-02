@@ -1152,9 +1152,19 @@ fn exclude_occurrence(
     let tzid = parameter_value(dtstart_head, "TZID").map(ToOwned::to_owned);
     validate_exclusion_target(&lines, recurrence_id)?;
 
+    // Value **and** zone. Comparing values alone treats
+    // `EXDATE;TZID=UTC:20260908T090000` as already excluding the 09:00
+    // Singapore occurrence, which it does not: the server matches by instant
+    // and those are different moments. The consequence was worse than a
+    // redundant write — the exclusion was skipped, the override was still
+    // removed, and the occurrence reappeared while the call reported success.
+    //
+    // Erring the other way is safe: an equivalent exclusion written in another
+    // form is added again, which is redundant and still excludes the right
+    // occurrence. Found by cross-engine review of this change.
     let already_excluded = recurrence_dates(&master_properties, "EXDATE")
         .iter()
-        .any(|date| date.value == recurrence_id);
+        .any(|date| date.value == recurrence_id && date.tzid.as_deref() == tzid.as_deref());
     let removed_override = remove_override(&mut lines, recurrence_id);
     let target_is_date = recurrence_id.len() == 8 && !recurrence_id.contains('T');
     let exdate = RecurrenceDate {
@@ -1266,7 +1276,16 @@ fn override_range(lines: &[String], recurrence_id: &str) -> Option<String> {
 }
 
 /// Remove the `VEVENT` whose `RECURRENCE-ID` value is `recurrence_id`.
+/// Remove **every** `VEVENT` whose `RECURRENCE-ID` value is `recurrence_id`,
+/// not just the first.
+///
+/// Duplicate overrides for one occurrence are invalid iCalendar, and stopping
+/// at the first left the rest behind: orphaned by the new `EXDATE`, so a later
+/// read reports the occurrence the deletion said it removed. Accepting invalid
+/// input and preserving the contradictory half of it is the wrong direction for
+/// a deletion tool. Found by cross-engine review of this change.
 fn remove_override(lines: &mut Vec<String>, recurrence_id: &str) -> bool {
+    let mut removed = false;
     let mut start = None;
     let mut matches = false;
     let mut index = 0;
@@ -1275,9 +1294,12 @@ fn remove_override(lines: &mut Vec<String>, recurrence_id: &str) -> bool {
             start = Some(index);
             matches = false;
         } else if lines[index].eq_ignore_ascii_case("END:VEVENT") {
-            if matches && let Some(start) = start {
-                lines.drain(start..=index);
-                return true;
+            if matches && let Some(begin) = start {
+                lines.drain(begin..=index);
+                removed = true;
+                index = begin;
+                start = None;
+                continue;
             }
             start = None;
         } else if start.is_some()
@@ -1289,7 +1311,7 @@ fn remove_override(lines: &mut Vec<String>, recurrence_id: &str) -> bool {
         }
         index += 1;
     }
-    false
+    removed
 }
 
 fn recurrence_dates(lines: &[String], name: &str) -> Vec<RecurrenceDate> {
@@ -2912,5 +2934,60 @@ mod tests {
         // wiremock fails verification on any unmatched request, so a PUT here
         // would surface rather than pass silently.
         server.verify().await;
+    }
+
+    /// Found by cross-engine review. An existing `EXDATE` with the same value
+    /// under a **different zone** is a different instant, so it excludes
+    /// nothing, and treating it as already-excluded skipped the write while
+    /// still removing the override: the occurrence reappeared and the call
+    /// reported success.
+    #[test]
+    fn an_exdate_in_a_different_zone_is_not_already_excluded() {
+        let ics = WEEKLY_SERIES.replace(
+            "RRULE:FREQ=WEEKLY\r\n",
+            "RRULE:FREQ=WEEKLY\r\nEXDATE;TZID=UTC:20260808T090000\r\n",
+        );
+        let exclusion = exclude_occurrence(&ics, "20260808T090000", false).unwrap();
+        assert!(
+            !exclusion.already_excluded,
+            "a UTC exclusion does not already cover the 09:00 Singapore occurrence"
+        );
+        let written = exclusion.ics.unwrap();
+        assert!(written.contains("EXDATE;TZID=Asia/Singapore:20260808T090000"));
+        // And the one that was already there is left alone rather than moved.
+        assert!(written.contains("EXDATE;TZID=UTC:20260808T090000"));
+    }
+
+    /// Found by cross-engine review. Duplicate overrides for one occurrence are
+    /// invalid iCalendar, and removing only the first left the rest orphaned by
+    /// the new `EXDATE`, so a later read reported the occurrence the deletion
+    /// claimed to remove.
+    #[test]
+    fn every_override_for_the_occurrence_is_removed_not_just_the_first() {
+        let duplicated = WEEKLY_SERIES.replace(
+            "END:VEVENT\r\nEND:VCALENDAR\r\n",
+            concat!(
+                "END:VEVENT\r\n",
+                "BEGIN:VEVENT\r\nUID:series\r\nSUMMARY:Moved again\r\n",
+                "RECURRENCE-ID;TZID=Asia/Singapore:20260808T090000\r\n",
+                "DTSTART;TZID=Asia/Singapore:20260808T160000\r\n",
+                "DTEND;TZID=Asia/Singapore:20260808T163000\r\n",
+                "END:VEVENT\r\nEND:VCALENDAR\r\n"
+            ),
+        );
+        assert_eq!(
+            duplicated.matches("RECURRENCE-ID").count(),
+            2,
+            "fixture must carry two overrides for the same occurrence"
+        );
+
+        let exclusion = exclude_occurrence(&duplicated, "20260808T090000", false).unwrap();
+        assert!(exclusion.removed_override);
+        let written = exclusion.ics.unwrap();
+        assert!(
+            !written.contains("RECURRENCE-ID"),
+            "no override for the excluded occurrence may survive:\n{written}"
+        );
+        assert!(!written.contains("Moved again"));
     }
 }
