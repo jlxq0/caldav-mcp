@@ -408,3 +408,32 @@ cargo test --all-features --locked
   created before it still notifies nobody. Backfilling on update would start
   sending mail about events that have never notified anyone, which is the
   irrecoverable direction, so it is deliberately not done.
+- **`calendar-user-address-set` on this server advertises `mailto:{login
+  name}`, which is not an address.** Stalwart builds it from the account's
+  login name rather than from its addresses:
+
+      crates/dav/src/principal/propfind.rs   vec![Href(format!("mailto:{}", account.name()))]
+      crates/common/src/cache/principals.rs  impl AccountCache { fn name() -> &str { self.name.as_ref() } }
+      crates/common/src/auth/mod.rs          AccountCache { name: Box<str>, addresses: Box<[EmailAddress]>, ... }
+
+  `name` and `addresses` are separate fields and `name()` returns the first, so
+  the set is always one element and that element is a login name. Verified
+  identical at `main` and at `v0.16.19`, the deployed tag, on 2026-09-02. Every
+  principal on this server has `name != emailAddress`, so the value is
+  `mailto:julian` and its equivalents rather than a mailbox.
+
+  **Consequences.** No client can pick an address from the set, so every client
+  sends whatever address its own account was configured with, which is why two
+  Macs on one principal send different organizers and why the iPhone needs no
+  special explanation. Do not reach for `calendar-user-address-set` to discover
+  a user's addresses, and do not read a one-element set as "this user has one
+  address".
+
+  **Recorded as a property of the server we run, not as a bug awaiting a
+  patch.** Reporting it upstream is not available to us, so nobody is waiting
+  for anything and the next person should work around it rather than expect it
+  to change.
+
+  **Unmeasured**: the live `PROPFIND`. All of the above reads the code that
+  serves it, blocked on the CalDAV credential that `#16` and `#19` also wait
+  on.
