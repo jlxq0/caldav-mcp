@@ -437,3 +437,25 @@ cargo test --all-features --locked
   **Unmeasured**: the live `PROPFIND`. All of the above reads the code that
   serves it, blocked on the CalDAV credential that `#16` and `#19` also wait
   on.
+- **`AGENTS.md` sits outside every gate, so a bad conflict resolution ships
+  green.** On 2026-09-02 a rebase of `#19` produced a file with **three copies
+  of each of three entries**, and `fmt --check`, `clippy -D warnings`, 139 tests,
+  `audit` and `deny` all passed, because none of them reads markdown. It was
+  caught by a stray `|||||||` marker surviving into the commit, which is luck
+  rather than a check.
+
+  **Two causes worth knowing.** A scripted resolver that handles
+  `<<<<<<<`/`=======`/`>>>>>>>` silently mangles a **diff3** conflict, whose
+  extra `||||||| ` base section it treats as content. And when both sides of an
+  additive conflict end mid-item, concatenating them drops the delimiter that
+  the shared trailing context was supplying — in Rust that is a missing `}` and
+  the compiler says so, in markdown nothing does.
+
+  **The control, which costs one command.** These conflicts are additive, so the
+  resolved file must be `main`'s file plus the branch's added block, exactly:
+
+      diff <(head -<N> AGENTS.md) <(git show origin/main:AGENTS.md)   # must be empty
+      grep -c "<the entry's first line>" AGENTS.md                     # must be 1
+
+  Rebuild it that way rather than resolving in place, and never iterate on a
+  damaged resolution: reset and redo it, because each pass adds a copy.
