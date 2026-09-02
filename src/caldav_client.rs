@@ -59,6 +59,19 @@ pub enum CaldavError {
     InvalidEncoding,
     #[error("CalDAV discovery response omitted {0}")]
     MissingProperty(&'static str),
+    /// The write would have made Stalwart send iTIP mail. There is no way to
+    /// suppress it for a `PUT`: `Schedule-Reply: F` is parsed but only
+    /// consulted on `DELETE`, and `SCHEDULE-AGENT=CLIENT` is persistent data
+    /// that would also silence every later legitimate update. So the operation
+    /// refuses and names everyone it would have written to.
+    #[error(
+        "this event has attendees, so the write would send them calendar mail that cannot be \
+         recalled: {}. Assume every one of them is written to — the only address Stalwart \
+         suppresses is the authenticated account's own. Pass send_scheduling_messages=true to \
+         proceed",
+        .0.join(", ")
+    )]
+    SchedulingRefused(Vec<String>),
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -528,6 +541,58 @@ impl CaldavClient {
             .map(ToOwned::to_owned);
         let components = parse_ical_events(&response.body, event_href)?;
         Ok((response.body, etag, components))
+    }
+
+    /// Exclude one occurrence from a recurring series: add its `EXDATE` to the
+    /// master and drop its override, in one `PUT`.
+    ///
+    /// The `EXDATE`'s value type and `TZID` come from the master's `DTSTART`,
+    /// not from the caller. `recurrence_id` is trusted as given — this does not
+    /// expand the `RRULE` to check the occurrence exists, because we have no
+    /// expander, and the tool description says so rather than implying a
+    /// validation that does not happen.
+    pub async fn delete_occurrence(
+        &self,
+        token: &str,
+        event_href: &str,
+        recurrence_id: &str,
+        etag: Option<&str>,
+        allow_scheduling: bool,
+    ) -> Result<Exclusion, CaldavError> {
+        let (ics, current_etag, _) = self.get_event_raw(token, event_href).await?;
+        let exclusion = exclude_occurrence(&ics, recurrence_id, allow_scheduling)?;
+        let Some(updated) = exclusion.ics.clone() else {
+            return Ok(exclusion);
+        };
+        let effective_etag = etag.map(ToOwned::to_owned).or(current_etag);
+        let mut headers = Vec::new();
+        if let Some(ref value) = effective_etag {
+            headers.push(("If-Match", normalize_etag(value)));
+        }
+        let header_refs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        let url = self.resolve_event_href(event_href)?;
+        let response = self
+            .dav_request(
+                token,
+                Method::PUT,
+                url,
+                Some(&updated),
+                "text/calendar; charset=utf-8",
+                &header_refs,
+            )
+            .await?;
+        match response.status {
+            StatusCode::OK | StatusCode::CREATED | StatusCode::NO_CONTENT => Ok(exclusion),
+            StatusCode::PRECONDITION_FAILED => Err(CaldavError::Conflict),
+            StatusCode::NOT_FOUND => Err(CaldavError::NotFound),
+            _ => {
+                Self::require_success(&response)?;
+                Ok(exclusion)
+            }
+        }
     }
 
     pub async fn update_event(
@@ -1008,6 +1073,247 @@ fn parse_ical_event(ics: &str, href: &str) -> Result<Event, CaldavError> {
 /// `EXDATE`/`RDATE` entries, one per value: both properties may repeat and
 /// each may carry a comma-separated list, and the parameters belong to the
 /// property rather than to any one value.
+/// Outcome of excluding one occurrence from a series.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Exclusion {
+    /// The calendar object to `PUT`, or `None` when the occurrence was already
+    /// excluded and there is nothing to write.
+    pub ics: Option<String>,
+    /// True when an `EXDATE` for this occurrence was already present.
+    pub already_excluded: bool,
+    /// True when an override component for this occurrence was removed in the
+    /// same write. Leaving it behind orphans it: clients show an occurrence
+    /// the series says does not exist.
+    pub removed_override: bool,
+    /// The `EXDATE` entry as written, so the caller can see the value type and
+    /// `TZID` it was given rather than the one it asked for.
+    pub exdate: RecurrenceDate,
+}
+
+/// Add an `EXDATE` for one occurrence and drop its override, in one write.
+///
+/// `recurrence_id` is the occurrence's **original** start, verbatim, as
+/// `RECURRENCE-ID` or the `RRULE` generates it — never a moved start and never
+/// a rendered UTC instant. The value type and `TZID` are taken from the
+/// master's `DTSTART` rather than from the caller, because RFC 5545 requires
+/// an `EXDATE` to match the generated occurrence exactly and a mismatch is
+/// accepted by the server and then excludes nothing.
+fn exclude_occurrence(
+    ics: &str,
+    recurrence_id: &str,
+    allow_scheduling: bool,
+) -> Result<Exclusion, CaldavError> {
+    let recurrence_id = recurrence_id.trim();
+    if recurrence_id.is_empty() {
+        return Err(CaldavError::InvalidInput(
+            "recurrence_id must be the occurrence's original start, e.g. 20260901T090000"
+                .to_owned(),
+        ));
+    }
+    let mut lines = unfold_ical_lines(ics);
+    if !allow_scheduling {
+        let attendees = all_attendees(&lines);
+        if !attendees.is_empty() {
+            return Err(CaldavError::SchedulingRefused(attendees));
+        }
+    }
+    let Some(master_start) = master_event_start(&lines) else {
+        return Err(CaldavError::InvalidInput(
+            "calendar object has no VEVENT".to_owned(),
+        ));
+    };
+    let master = event_lines(&lines);
+    let master_properties = direct_event_properties(&master);
+    let Some((dtstart_head, _dtstart_value)) = master_properties.iter().find_map(|line| {
+        let (head, value) = line.split_once(':')?;
+        property_name(head)
+            .eq_ignore_ascii_case("DTSTART")
+            .then_some((head, value))
+    }) else {
+        return Err(CaldavError::InvalidInput(
+            "series master has no DTSTART".to_owned(),
+        ));
+    };
+    if master_properties.iter().all(|line| {
+        line.split_once(':')
+            .is_none_or(|(head, _)| !property_name(head).eq_ignore_ascii_case("RRULE"))
+    }) && !master_properties.iter().any(|line| {
+        line.split_once(':')
+            .is_some_and(|(head, _)| property_name(head).eq_ignore_ascii_case("RDATE"))
+    }) {
+        return Err(CaldavError::InvalidInput(
+            "event is not recurring: it has neither RRULE nor RDATE".to_owned(),
+        ));
+    }
+
+    // `DTSTART`'s zone, for a date-time exclusion. Its value type is no longer
+    // consulted: the exclusion is shaped to the caller's value, and Stalwart
+    // matches by instant rather than by literal form.
+    let tzid = parameter_value(dtstart_head, "TZID").map(ToOwned::to_owned);
+    validate_exclusion_target(&lines, recurrence_id)?;
+
+    // Value **and** zone. Comparing values alone treats
+    // `EXDATE;TZID=UTC:20260908T090000` as already excluding the 09:00
+    // Singapore occurrence, which it does not: the server matches by instant
+    // and those are different moments. The consequence was worse than a
+    // redundant write — the exclusion was skipped, the override was still
+    // removed, and the occurrence reappeared while the call reported success.
+    //
+    // Erring the other way is safe: an equivalent exclusion written in another
+    // form is added again, which is redundant and still excludes the right
+    // occurrence. Found by cross-engine review of this change.
+    let already_excluded = recurrence_dates(&master_properties, "EXDATE")
+        .iter()
+        .any(|date| date.value == recurrence_id && date.tzid.as_deref() == tzid.as_deref());
+    let removed_override = remove_override(&mut lines, recurrence_id);
+    let target_is_date = recurrence_id.len() == 8 && !recurrence_id.contains('T');
+    let exdate = RecurrenceDate {
+        value: recurrence_id.to_owned(),
+        tzid: if target_is_date { None } else { tzid.clone() },
+        is_date: target_is_date,
+    };
+    if already_excluded && !removed_override {
+        return Ok(Exclusion {
+            ics: None,
+            already_excluded,
+            removed_override,
+            exdate,
+        });
+    }
+    if !already_excluded {
+        // Shaped to the value the caller gave, not blindly to `DTSTART`'s
+        // parameters. A date under a `TZID=` head is malformed iCalendar, and
+        // that combination becomes reachable now that a value type differing
+        // from `DTSTART` is no longer refused. Stalwart matches by instant, so
+        // either well-formed shape excludes the right occurrence; what it
+        // cannot do is repair a property that is not well formed.
+        let head = match (&tzid, target_is_date) {
+            (_, true) => "EXDATE;VALUE=DATE".to_owned(),
+            (Some(tzid), false) => format!("EXDATE;TZID={tzid}"),
+            (None, false) => "EXDATE".to_owned(),
+        };
+        let insertion = master_event_start(&lines).unwrap_or(master_start) + 1;
+        lines.insert(insertion, format!("{head}:{recurrence_id}"));
+    }
+    replace_event_property(
+        &mut lines,
+        "DTSTAMP",
+        vec![format!("DTSTAMP:{}", format_dav_utc(Utc::now()))],
+    );
+    increment_sequence(&mut lines);
+    Ok(Exclusion {
+        ics: Some(format!("{}\r\n", lines.join("\r\n"))),
+        already_excluded,
+        removed_override,
+        exdate,
+    })
+}
+
+/// The three ways an exclusion is wrong before it is written, each of which
+/// the server would otherwise accept and then not act on.
+/// The one way an exclusion is wrong before it is written that survived
+/// measurement.
+///
+/// Two others did not, and both were removed on 2026-09-02 rather than kept as
+/// belt and braces, because each was justified by a claim about the server that
+/// the run refuted (`#16`, `issuecomment-17026`):
+///
+/// * **A value type differing from `DTSTART` was refused** on the grounds that
+///   it "excludes nothing". It excludes: `EXDATE:20260903T000000Z` removes an
+///   occurrence of an all-day series, and `EXDATE:20260908T010000Z` removes one
+///   from a series whose `DTSTART` carries `TZID=Asia/Singapore`. **Stalwart
+///   matches an exclusion by instant, not by literal form.**
+/// * **The series' first occurrence was refused** on the grounds that "some
+///   servers treat `DTSTART` as implicitly included". Not this one: an `EXDATE`
+///   for the first occurrence removed it, leaving five of six.
+///
+/// What survives is not a claim about the server. `RANGE=THISANDFUTURE` names a
+/// different operation, so excluding that occurrence is not the thing the
+/// caller asked for whatever the server would do with it.
+fn validate_exclusion_target(lines: &[String], recurrence_id: &str) -> Result<(), CaldavError> {
+    if let Some(range) = override_range(lines, recurrence_id) {
+        return Err(CaldavError::InvalidInput(format!(
+            "the override for {recurrence_id} carries RANGE={range}, which applies to that \
+             occurrence and every later one. Excluding it is not the same operation and is not \
+             supported"
+        )));
+    }
+    Ok(())
+}
+
+/// Every `ATTENDEE` in the object, master and overrides alike.
+///
+/// All of them, and assume all of them are mailed. `send_update_messages()`
+/// skips only `email.is_local`, and `is_local` is exact membership of the
+/// *authenticated account's own* address set — its addresses and its groups'
+/// — not the domains the server hosts. Another mailbox on the same Stalwart is
+/// not local to this account and does receive an iMIP. Naming too many is
+/// recoverable; naming too few puts mail in a stranger's inbox.
+fn all_attendees(lines: &[String]) -> Vec<String> {
+    let mut attendees = Vec::new();
+    for line in lines {
+        let Some((head, value)) = line.split_once(':') else {
+            continue;
+        };
+        if property_name(head).eq_ignore_ascii_case("ATTENDEE") {
+            let address = strip_mailto(&unescape_ical(value));
+            if !attendees.contains(&address) {
+                attendees.push(address);
+            }
+        }
+    }
+    attendees
+}
+
+/// The `RANGE` parameter on the override for `recurrence_id`, if there is one.
+fn override_range(lines: &[String], recurrence_id: &str) -> Option<String> {
+    lines.iter().find_map(|line| {
+        let (head, value) = line.split_once(':')?;
+        (property_name(head).eq_ignore_ascii_case("RECURRENCE-ID") && value.trim() == recurrence_id)
+            .then(|| parameter_value(head, "RANGE").map(str::to_uppercase))
+            .flatten()
+    })
+}
+
+/// Remove the `VEVENT` whose `RECURRENCE-ID` value is `recurrence_id`.
+/// Remove **every** `VEVENT` whose `RECURRENCE-ID` value is `recurrence_id`,
+/// not just the first.
+///
+/// Duplicate overrides for one occurrence are invalid iCalendar, and stopping
+/// at the first left the rest behind: orphaned by the new `EXDATE`, so a later
+/// read reports the occurrence the deletion said it removed. Accepting invalid
+/// input and preserving the contradictory half of it is the wrong direction for
+/// a deletion tool. Found by cross-engine review of this change.
+fn remove_override(lines: &mut Vec<String>, recurrence_id: &str) -> bool {
+    let mut removed = false;
+    let mut start = None;
+    let mut matches = false;
+    let mut index = 0;
+    while index < lines.len() {
+        if lines[index].eq_ignore_ascii_case("BEGIN:VEVENT") {
+            start = Some(index);
+            matches = false;
+        } else if lines[index].eq_ignore_ascii_case("END:VEVENT") {
+            if matches && let Some(begin) = start {
+                lines.drain(begin..=index);
+                removed = true;
+                index = begin;
+                start = None;
+                continue;
+            }
+            start = None;
+        } else if start.is_some()
+            && let Some((head, value)) = lines[index].split_once(':')
+            && property_name(head).eq_ignore_ascii_case("RECURRENCE-ID")
+            && value.trim() == recurrence_id
+        {
+            matches = true;
+        }
+        index += 1;
+    }
+    removed
+}
+
 fn recurrence_dates(lines: &[String], name: &str) -> Vec<RecurrenceDate> {
     let mut dates = Vec::new();
     for line in lines {
@@ -2389,5 +2695,299 @@ mod tests {
             !patched.contains("ORGANIZER"),
             "an update must not silently turn a quiet event into one that mails people"
         );
+    }
+
+    const WEEKLY_SERIES: &str = concat!(
+        "BEGIN:VCALENDAR\r\n",
+        "BEGIN:VEVENT\r\nUID:series\r\nSUMMARY:Standup\r\nSEQUENCE:1\r\n",
+        "DTSTART;TZID=Asia/Singapore:20260801T090000\r\n",
+        "DTEND;TZID=Asia/Singapore:20260801T093000\r\n",
+        "RRULE:FREQ=WEEKLY\r\n",
+        "END:VEVENT\r\n",
+        "BEGIN:VEVENT\r\nUID:series\r\nSUMMARY:Moved\r\n",
+        "RECURRENCE-ID;TZID=Asia/Singapore:20260808T090000\r\n",
+        "DTSTART;TZID=Asia/Singapore:20260808T140000\r\n",
+        "DTEND;TZID=Asia/Singapore:20260808T143000\r\n",
+        "END:VEVENT\r\nEND:VCALENDAR\r\n"
+    );
+
+    /// The exclusion has to carry the same value type and `TZID` the `RRULE`
+    /// generates, which is `DTSTART`'s and never the caller's. And the
+    /// override goes in the same write: left behind it is an orphan, an
+    /// occurrence clients render for a date the series says does not exist.
+    #[test]
+    fn excluding_an_occurrence_writes_an_exdate_shaped_like_dtstart() {
+        let exclusion = exclude_occurrence(WEEKLY_SERIES, "20260808T090000", false).unwrap();
+
+        assert!(!exclusion.already_excluded);
+        assert!(exclusion.removed_override);
+        assert_eq!(exclusion.exdate.tzid.as_deref(), Some("Asia/Singapore"));
+        assert!(!exclusion.exdate.is_date);
+
+        let ics = exclusion.ics.unwrap();
+        assert!(ics.contains("EXDATE;TZID=Asia/Singapore:20260808T090000"));
+        assert!(
+            !ics.contains("RECURRENCE-ID"),
+            "the override must be gone, not orphaned"
+        );
+        assert!(ics.contains("SEQUENCE:2"));
+    }
+
+    /// A floating all-day series takes `VALUE=DATE`, because an `EXDATE`
+    /// written as a date-time against a date `DTSTART` excludes nothing and
+    /// the server accepts it.
+    #[test]
+    fn an_all_day_series_gets_a_value_date_exclusion() {
+        let ics = concat!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:daily\r\nSUMMARY:Leave\r\n",
+            "DTSTART;VALUE=DATE:20260801\r\nDTEND;VALUE=DATE:20260802\r\n",
+            "RRULE:FREQ=DAILY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+        let exclusion = exclude_occurrence(ics, "20260805", false).unwrap();
+        assert!(exclusion.exdate.is_date);
+        assert!(exclusion.exdate.tzid.is_none());
+        assert!(
+            exclusion
+                .ics
+                .unwrap()
+                .contains("EXDATE;VALUE=DATE:20260805")
+        );
+    }
+
+    /// Measured 2026-09-02 against the deployed Stalwart: a value type
+    /// differing from `DTSTART` is **not** refused, because it excludes.
+    /// `EXDATE:20260903T000000Z` removed an occurrence of an all-day series and
+    /// `EXDATE:20260908T010000Z` removed one from a zoned series, so the server
+    /// matches by instant rather than by literal form. The exclusion is instead
+    /// shaped to the caller's value, since a date under a `TZID=` head would be
+    /// malformed and no server can repair that.
+    #[test]
+    fn a_date_target_is_written_as_a_date_whatever_dtstart_carries() {
+        let exclusion = exclude_occurrence(WEEKLY_SERIES, "20260808", false).unwrap();
+        let ics = exclusion.ics.unwrap();
+        assert!(
+            ics.contains("EXDATE;VALUE=DATE:20260808"),
+            "a date target must not be written under the series' TZID head:\n{ics}"
+        );
+        assert!(exclusion.exdate.is_date);
+        assert!(exclusion.exdate.tzid.is_none());
+    }
+
+    /// Re-excluding an already excluded occurrence succeeds and writes
+    /// nothing, rather than duplicating the `EXDATE` or erroring.
+    #[test]
+    fn excluding_twice_is_idempotent() {
+        let first = exclude_occurrence(WEEKLY_SERIES, "20260808T090000", false).unwrap();
+        let second = exclude_occurrence(&first.ics.unwrap(), "20260808T090000", false).unwrap();
+        assert!(second.already_excluded);
+        assert!(!second.removed_override);
+        assert!(
+            second.ics.is_none(),
+            "nothing to write means no PUT, and no SEQUENCE bump"
+        );
+    }
+
+    /// `Schedule-Reply: F` is inert on `PUT` and `SCHEDULE-AGENT=CLIENT` is
+    /// persistent, so there is no way to make this write quiet. The only
+    /// honest options are sending the mail and not touching the event.
+    #[test]
+    fn an_attended_series_refuses_and_names_every_attendee() {
+        let ics = WEEKLY_SERIES
+            .replace(
+                "SUMMARY:Standup\r\n",
+                "SUMMARY:Standup\r\nATTENDEE;CN=A:mailto:a@example.test\r\n",
+            )
+            .replace(
+                "SUMMARY:Moved\r\n",
+                "SUMMARY:Moved\r\nATTENDEE;CN=B:mailto:b@example.test\r\n",
+            );
+        let error = exclude_occurrence(&ics, "20260808T090000", false).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("a@example.test"), "got: {message}");
+        assert!(
+            message.contains("b@example.test"),
+            "an attendee on an override is still someone who gets mail: {message}"
+        );
+
+        // And the opt-in is the only way through.
+        let allowed = exclude_occurrence(&ics, "20260808T090000", true).unwrap();
+        assert!(allowed.ics.is_some());
+    }
+
+    /// `RANGE=THISANDFUTURE` applies to the occurrence and every later one.
+    /// Excluding it is a different operation, so it is rejected explicitly
+    /// rather than silently treated as a single-instance exclusion.
+    #[test]
+    fn a_this_and_future_override_is_rejected_rather_than_excluded() {
+        let ics = WEEKLY_SERIES.replace(
+            "RECURRENCE-ID;TZID=Asia/Singapore:20260808T090000",
+            "RECURRENCE-ID;TZID=Asia/Singapore;RANGE=THISANDFUTURE:20260808T090000",
+        );
+        let error = exclude_occurrence(&ics, "20260808T090000", false).unwrap_err();
+        assert!(
+            error.to_string().contains("THISANDFUTURE"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Measured 2026-09-02: this server honours an `EXDATE` for the series'
+    /// first occurrence, removing it and leaving five of six. The refusal that
+    /// stood here rested on "some servers treat `DTSTART` as implicitly
+    /// included", which is received wisdom about servers in general and not
+    /// true of the one we run.
+    #[test]
+    fn the_first_occurrence_can_be_excluded() {
+        let exclusion = exclude_occurrence(WEEKLY_SERIES, "20260801T090000", false).unwrap();
+        let ics = exclusion.ics.unwrap();
+        assert!(ics.contains("EXDATE;TZID=Asia/Singapore:20260801T090000"));
+    }
+
+    #[test]
+    fn a_non_recurring_event_cannot_have_an_occurrence_excluded() {
+        let ics = concat!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:one\r\nSUMMARY:Once\r\n",
+            "DTSTART;TZID=Asia/Singapore:20260801T090000\r\n",
+            "DTEND;TZID=Asia/Singapore:20260801T093000\r\n",
+            "END:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+        let error = exclude_occurrence(ics, "20260808T090000", false).unwrap_err();
+        assert!(
+            error.to_string().contains("not recurring"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_occurrence_puts_the_excluded_series_with_if_match() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dav/cal/u/default/series.ics"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_string(WEEKLY_SERIES),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/dav/cal/u/default/series.ics"))
+            .and(header("if-match", "\"v1\""))
+            .and(body_string_contains(
+                "EXDATE;TZID=Asia/Singapore:20260808T090000",
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = CaldavClient::new(&server.uri(), None).unwrap();
+
+        let exclusion = client
+            .delete_occurrence(
+                "token",
+                "/dav/cal/u/default/series.ics",
+                "20260808T090000",
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert!(exclusion.removed_override);
+        server.verify().await;
+    }
+
+    /// Already excluded means nothing to write, so there must be no `PUT` at
+    /// all — not a no-op `PUT` that bumps `SEQUENCE` and, on an attended
+    /// series, would send mail for a change that did not happen.
+    #[tokio::test]
+    async fn delete_occurrence_does_not_put_when_already_excluded() {
+        let server = MockServer::start().await;
+        let already = WEEKLY_SERIES.replace(
+            "RRULE:FREQ=WEEKLY\r\n",
+            "RRULE:FREQ=WEEKLY\r\nEXDATE;TZID=Asia/Singapore:20260815T090000\r\n",
+        );
+        Mock::given(method("GET"))
+            .and(path("/dav/cal/u/default/series.ics"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_string(already),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = CaldavClient::new(&server.uri(), None).unwrap();
+
+        let exclusion = client
+            .delete_occurrence(
+                "token",
+                "/dav/cal/u/default/series.ics",
+                "20260815T090000",
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert!(exclusion.already_excluded);
+        // wiremock fails verification on any unmatched request, so a PUT here
+        // would surface rather than pass silently.
+        server.verify().await;
+    }
+
+    /// Found by cross-engine review. An existing `EXDATE` with the same value
+    /// under a **different zone** is a different instant, so it excludes
+    /// nothing, and treating it as already-excluded skipped the write while
+    /// still removing the override: the occurrence reappeared and the call
+    /// reported success.
+    #[test]
+    fn an_exdate_in_a_different_zone_is_not_already_excluded() {
+        let ics = WEEKLY_SERIES.replace(
+            "RRULE:FREQ=WEEKLY\r\n",
+            "RRULE:FREQ=WEEKLY\r\nEXDATE;TZID=UTC:20260808T090000\r\n",
+        );
+        let exclusion = exclude_occurrence(&ics, "20260808T090000", false).unwrap();
+        assert!(
+            !exclusion.already_excluded,
+            "a UTC exclusion does not already cover the 09:00 Singapore occurrence"
+        );
+        let written = exclusion.ics.unwrap();
+        assert!(written.contains("EXDATE;TZID=Asia/Singapore:20260808T090000"));
+        // And the one that was already there is left alone rather than moved.
+        assert!(written.contains("EXDATE;TZID=UTC:20260808T090000"));
+    }
+
+    /// Found by cross-engine review. Duplicate overrides for one occurrence are
+    /// invalid iCalendar, and removing only the first left the rest orphaned by
+    /// the new `EXDATE`, so a later read reported the occurrence the deletion
+    /// claimed to remove.
+    #[test]
+    fn every_override_for_the_occurrence_is_removed_not_just_the_first() {
+        let duplicated = WEEKLY_SERIES.replace(
+            "END:VEVENT\r\nEND:VCALENDAR\r\n",
+            concat!(
+                "END:VEVENT\r\n",
+                "BEGIN:VEVENT\r\nUID:series\r\nSUMMARY:Moved again\r\n",
+                "RECURRENCE-ID;TZID=Asia/Singapore:20260808T090000\r\n",
+                "DTSTART;TZID=Asia/Singapore:20260808T160000\r\n",
+                "DTEND;TZID=Asia/Singapore:20260808T163000\r\n",
+                "END:VEVENT\r\nEND:VCALENDAR\r\n"
+            ),
+        );
+        assert_eq!(
+            duplicated.matches("RECURRENCE-ID").count(),
+            2,
+            "fixture must carry two overrides for the same occurrence"
+        );
+
+        let exclusion = exclude_occurrence(&duplicated, "20260808T090000", false).unwrap();
+        assert!(exclusion.removed_override);
+        let written = exclusion.ics.unwrap();
+        assert!(
+            !written.contains("RECURRENCE-ID"),
+            "no override for the excluded occurrence may survive:\n{written}"
+        );
+        assert!(!written.contains("Moved again"));
     }
 }
