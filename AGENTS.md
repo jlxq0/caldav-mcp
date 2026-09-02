@@ -469,8 +469,27 @@ cargo test --all-features --locked
   still sets it by exact membership. Read this before designing any experiment that puts an
   `ATTENDEE` in a fixture: expecting no mail for a same-server attendee makes a
   correct run look like a bug.
-- An `EXDATE` must match the occurrence as the `RRULE` generates it: same value
-  type and same `TZID` as the master's `DTSTART`. Take both from `DTSTART`
+- **Stalwart matches an `EXDATE` by instant, not by literal form.** Measured
+  2026-09-02 against the deployed server, one collection created and deleted for
+  the purpose (`#16`, `issuecomment-17026`): a UTC instant excludes an
+  occurrence of a zoned series, a date-time excludes one of an all-day series,
+  and an `EXDATE` for the series' **first** occurrence removes it. Two refusals
+  in `delete_occurrence` rested on the opposite and were removed rather than
+  kept as belt and braces, because each was justified by a claim the run
+  refuted. What still matters is the **instant**: `TZID=UTC:20260908T090000`
+  against a `TZID=Asia/Singapore` series excludes nothing, because 09:00 UTC is
+  a different moment.
+
+  **The exclusion is shaped to the caller's value rather than to `DTSTART`'s
+  parameters**, since a date under a `TZID=` head is malformed and no server can
+  repair that.
+
+  **And a wrong instant is still accepted with 201 and still does nothing**, so
+  the hazard is confirmed and only its cause was misdescribed. A value the
+  `RRULE` never generates is indistinguishable from a wrongly-zoned one, which
+  is why an expander is the only possible pre-flight check.
+
+  An `EXDATE` must still match the occurrence as the `RRULE` generates it: Take both from `DTSTART`
   rather than from the caller — a mismatch is accepted by the server and
   excludes nothing, which is a write that reports success and changes what the
   calendar shows not at all. Remove the matching override in the same `PUT`, or

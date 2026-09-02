@@ -1124,7 +1124,7 @@ fn exclude_occurrence(
     };
     let master = event_lines(&lines);
     let master_properties = direct_event_properties(&master);
-    let Some((dtstart_head, dtstart_value)) = master_properties.iter().find_map(|line| {
+    let Some((dtstart_head, _dtstart_value)) = master_properties.iter().find_map(|line| {
         let (head, value) = line.split_once(':')?;
         property_name(head)
             .eq_ignore_ascii_case("DTSTART")
@@ -1146,20 +1146,21 @@ fn exclude_occurrence(
         ));
     }
 
+    // `DTSTART`'s zone, for a date-time exclusion. Its value type is no longer
+    // consulted: the exclusion is shaped to the caller's value, and Stalwart
+    // matches by instant rather than by literal form.
     let tzid = parameter_value(dtstart_head, "TZID").map(ToOwned::to_owned);
-    let is_date = parameter_value(dtstart_head, "VALUE")
-        .is_some_and(|value| value.eq_ignore_ascii_case("DATE"))
-        || (dtstart_value.len() == 8 && !dtstart_value.contains('T'));
-    validate_exclusion_target(&lines, recurrence_id, dtstart_value, is_date)?;
+    validate_exclusion_target(&lines, recurrence_id)?;
 
     let already_excluded = recurrence_dates(&master_properties, "EXDATE")
         .iter()
         .any(|date| date.value == recurrence_id);
     let removed_override = remove_override(&mut lines, recurrence_id);
+    let target_is_date = recurrence_id.len() == 8 && !recurrence_id.contains('T');
     let exdate = RecurrenceDate {
         value: recurrence_id.to_owned(),
-        tzid: tzid.clone(),
-        is_date,
+        tzid: if target_is_date { None } else { tzid.clone() },
+        is_date: target_is_date,
     };
     if already_excluded && !removed_override {
         return Ok(Exclusion {
@@ -1170,9 +1171,15 @@ fn exclude_occurrence(
         });
     }
     if !already_excluded {
-        let head = match (&tzid, is_date) {
-            (Some(tzid), _) => format!("EXDATE;TZID={tzid}"),
-            (None, true) => "EXDATE;VALUE=DATE".to_owned(),
+        // Shaped to the value the caller gave, not blindly to `DTSTART`'s
+        // parameters. A date under a `TZID=` head is malformed iCalendar, and
+        // that combination becomes reachable now that a value type differing
+        // from `DTSTART` is no longer refused. Stalwart matches by instant, so
+        // either well-formed shape excludes the right occurrence; what it
+        // cannot do is repair a property that is not well formed.
+        let head = match (&tzid, target_is_date) {
+            (_, true) => "EXDATE;VALUE=DATE".to_owned(),
+            (Some(tzid), false) => format!("EXDATE;TZID={tzid}"),
             (None, false) => "EXDATE".to_owned(),
         };
         let insertion = master_event_start(&lines).unwrap_or(master_start) + 1;
@@ -1194,29 +1201,26 @@ fn exclude_occurrence(
 
 /// The three ways an exclusion is wrong before it is written, each of which
 /// the server would otherwise accept and then not act on.
-fn validate_exclusion_target(
-    lines: &[String],
-    recurrence_id: &str,
-    dtstart_value: &str,
-    is_date: bool,
-) -> Result<(), CaldavError> {
-    let target_is_date = recurrence_id.len() == 8 && !recurrence_id.contains('T');
-    if target_is_date != is_date {
-        return Err(CaldavError::InvalidInput(format!(
-            "recurrence_id {recurrence_id:?} is a {} but the series DTSTART is a {}; an EXDATE \
-             whose value type differs from DTSTART excludes nothing and the server accepts it",
-            if target_is_date { "date" } else { "date-time" },
-            if is_date { "date" } else { "date-time" },
-        )));
-    }
-    if recurrence_id == dtstart_value {
-        return Err(CaldavError::InvalidInput(
-            "recurrence_id is the series' first occurrence; some servers treat DTSTART as \
-             implicitly included and an EXDATE for it is unreliable. Move DTSTART or delete the \
-             series instead"
-                .to_owned(),
-        ));
-    }
+/// The one way an exclusion is wrong before it is written that survived
+/// measurement.
+///
+/// Two others did not, and both were removed on 2026-09-02 rather than kept as
+/// belt and braces, because each was justified by a claim about the server that
+/// the run refuted (`#16`, `issuecomment-17026`):
+///
+/// * **A value type differing from `DTSTART` was refused** on the grounds that
+///   it "excludes nothing". It excludes: `EXDATE:20260903T000000Z` removes an
+///   occurrence of an all-day series, and `EXDATE:20260908T010000Z` removes one
+///   from a series whose `DTSTART` carries `TZID=Asia/Singapore`. **Stalwart
+///   matches an exclusion by instant, not by literal form.**
+/// * **The series' first occurrence was refused** on the grounds that "some
+///   servers treat `DTSTART` as implicitly included". Not this one: an `EXDATE`
+///   for the first occurrence removed it, leaving five of six.
+///
+/// What survives is not a claim about the server. `RANGE=THISANDFUTURE` names a
+/// different operation, so excluding that occurrence is not the thing the
+/// caller asked for whatever the server would do with it.
+fn validate_exclusion_target(lines: &[String], recurrence_id: &str) -> Result<(), CaldavError> {
     if let Some(range) = override_range(lines, recurrence_id) {
         return Err(CaldavError::InvalidInput(format!(
             "the override for {recurrence_id} carries RANGE={range}, which applies to that \
@@ -2728,15 +2732,23 @@ mod tests {
         );
     }
 
-    /// Mixing the value types is the failure this whole tool exists to avoid,
-    /// so it is refused rather than written.
+    /// Measured 2026-09-02 against the deployed Stalwart: a value type
+    /// differing from `DTSTART` is **not** refused, because it excludes.
+    /// `EXDATE:20260903T000000Z` removed an occurrence of an all-day series and
+    /// `EXDATE:20260908T010000Z` removed one from a zoned series, so the server
+    /// matches by instant rather than by literal form. The exclusion is instead
+    /// shaped to the caller's value, since a date under a `TZID=` head would be
+    /// malformed and no server can repair that.
     #[test]
-    fn a_value_type_that_disagrees_with_dtstart_is_refused() {
-        let error = exclude_occurrence(WEEKLY_SERIES, "20260808", false).unwrap_err();
+    fn a_date_target_is_written_as_a_date_whatever_dtstart_carries() {
+        let exclusion = exclude_occurrence(WEEKLY_SERIES, "20260808", false).unwrap();
+        let ics = exclusion.ics.unwrap();
         assert!(
-            error.to_string().contains("excludes nothing"),
-            "unexpected error: {error}"
+            ics.contains("EXDATE;VALUE=DATE:20260808"),
+            "a date target must not be written under the series' TZID head:\n{ics}"
         );
+        assert!(exclusion.exdate.is_date);
+        assert!(exclusion.exdate.tzid.is_none());
     }
 
     /// Re-excluding an already excluded occurrence succeeds and writes
@@ -2796,16 +2808,16 @@ mod tests {
         );
     }
 
-    /// Some servers treat `DTSTART` as implicitly included, so an `EXDATE` for
-    /// the first occurrence is unreliable. Refuse rather than write something
-    /// that may do nothing.
+    /// Measured 2026-09-02: this server honours an `EXDATE` for the series'
+    /// first occurrence, removing it and leaving five of six. The refusal that
+    /// stood here rested on "some servers treat `DTSTART` as implicitly
+    /// included", which is received wisdom about servers in general and not
+    /// true of the one we run.
     #[test]
-    fn excluding_the_first_occurrence_is_refused() {
-        let error = exclude_occurrence(WEEKLY_SERIES, "20260801T090000", false).unwrap_err();
-        assert!(
-            error.to_string().contains("first occurrence"),
-            "unexpected error: {error}"
-        );
+    fn the_first_occurrence_can_be_excluded() {
+        let exclusion = exclude_occurrence(WEEKLY_SERIES, "20260801T090000", false).unwrap();
+        let ics = exclusion.ics.unwrap();
+        assert!(ics.contains("EXDATE;TZID=Asia/Singapore:20260801T090000"));
     }
 
     #[test]
