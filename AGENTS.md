@@ -459,3 +459,32 @@ cargo test --all-features --locked
 
   Rebuild it that way rather than resolving in place, and never iterate on a
   damaged resolution: reset and redo it, because each pass adds a copy.
+- **A claim that arrives flagged as an inference and leaves unflagged has been
+  laundered by the retelling.** On 2026-08-26 a peer gave me a reading of a 401
+  with the inference explicitly marked: *"the error names the credential type
+  and the dispatch file, so I am reasoning from the message rather than from the
+  source."* I adopted it as fact and repeated it in an issue, a pull request
+  body and three messages. **The marking did not survive the first retelling**,
+  and for six days every reader after me saw a measurement.
+
+  The fleet already has this for numbers crossing a session boundary. It is the
+  same shape for a *reading*: carry the marking with the claim, or do not carry
+  the claim.
+
+- **Re-running a measurement is not the same as testing it.** That 401 is
+  returned both by "this directory cannot hold passwords" and by "this principal
+  has none", and I re-measured it repeatedly and reported the repetition as
+  diligence. **A negative re-run carefully is still a negative from an
+  instrument with one answer.** What settled it was a different population
+  entirely: 6 of 26 principals on that directory carry a credential, and
+  non-human probe accounts with passwords already existed on it. The fixtures
+  were not missing accounts, they were missing one field.
+
+  Before re-running a negative, ask what result would have distinguished the two
+  explanations. If the instrument cannot produce it, change instruments.
+
+- **A blocker outside this repository is handed up, named, on the day it is
+  found.** Waiting on it is only correct once somebody has been asked. The
+  `blocked` label makes a hold visible and does **not** route it, so a PR can
+  sit correctly labelled and still be waiting on a question nobody has received.
+  Two failures, two fixes: label it *and* name the owner.
