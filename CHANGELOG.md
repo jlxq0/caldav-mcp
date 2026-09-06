@@ -1,8 +1,29 @@
 # Changelog
 
 This project follows semantic versioning while it is pre-1.0. This file and the
-signed `vX.Y.Z` tags are the release record; Forgejo release objects are not
+`vX.Y.Z` tags are the release record; Forgejo release objects are not
 maintained, so their absence says nothing about whether a version shipped.
+
+Tags from `v0.3.0` are signed. `v0.2.0`, `v0.2.1` and `v0.2.2` are annotated and
+**unsigned**, though this file and `AGENTS.md` both described them as signed
+until now. They are not re-cut, because forcing a ref an image already points at
+makes it briefly ambiguous which image it names.
+
+## 0.3.0 - 2026-09-06
+
+### Added
+
+- `delete_occurrence`, refusing when the deletion would send calendar mail.
+- `xff_scopes` on the forwarded-for line: one token per `X-Forwarded-For` entry,
+  in order, classifying each as `public`, `private` or `unparseable` and never
+  recording an address. The count alone could not separate a spoofable public
+  first entry from one our own fabric appended, and that distinction settles
+  `trusted_proxy_hops` here and three constants elsewhere.
+
+  `public` means "not one of the private scopes", not "routable": CGNAT
+  `100.64.0.0/10` and the documentation ranges land in it. Those are false
+  positives and they err recoverably, so read a `public` as worth checking
+  rather than as a spoofed chain.
 
 ## 0.2.2 - 2026-08-27
 

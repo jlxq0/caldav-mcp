@@ -118,7 +118,10 @@ cargo test --all-features --locked
   change it with nothing else going red. An unbracketed `"::1"` arm was
   unreachable for the same reason and was removed; in a security predicate an
   unreachable arm reads as coverage that is not there. Do not add it back.
-- `CHANGELOG.md` and the signed `vX.Y.Z` tags are this repo's release record.
+- `CHANGELOG.md` and the `vX.Y.Z` tags are this repo's release record. Tags from
+  `v0.3.0` are signed; `v0.2.0` through `v0.2.2` are annotated and unsigned,
+  though this line and `CHANGELOG.md` both called them signed until 2026-09-06.
+  Check with `git tag -v` rather than reading either file.
   Do not create Forgejo release objects: nothing downstream reads them (Renovate
   tracks the container registry, ArgoCD reads the pinned digest, CI triggers on
   the tag), and a releases page carrying some versions and not others answers
