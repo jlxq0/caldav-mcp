@@ -68,14 +68,22 @@ pub async fn bearer_auth(
                     .get("x-forwarded-for")
                     .and_then(|v| v.to_str().ok());
                 let client_ip = last_used::parse_client_ip(xff, state.config.trusted_proxy_hops);
-                // The count and the configured value, never the entries. The
-                // correct `CALDAV_MCP_TRUSTED_PROXY_HOPS` is the number of
-                // proxies that appended on the way in, so these two side by
-                // side answer whether the deployment is configured right from
-                // one real request. Both deployments currently set 0, which
-                // blanks `client_ip` before the header is even read.
+                // The count, the per-entry scope and the configured value,
+                // never the entries themselves. The correct
+                // `CALDAV_MCP_TRUSTED_PROXY_HOPS` is the number of proxies that
+                // appended on the way in, so these answer whether the deployment
+                // is configured right from one real request. Both deployments
+                // currently set 0, which blanks `client_ip` before the header is
+                // even read.
+                //
+                // The count alone cannot separate a spoofable public first entry
+                // from a private one our own fabric appended, and that is the
+                // question four constants across three repositories depend on.
+                // 47 unanimous `xff_entries=2` over 24 hours settled the count
+                // and said nothing about the classification.
                 tracing::info!(
                     xff_entries = last_used::count_xff_entries(xff),
+                    xff_scopes = %last_used::classify_xff_entries(xff),
                     trusted_proxy_hops = state.config.trusted_proxy_hops,
                     client_ip_resolved = client_ip.is_some(),
                     "forwarded-for chain"

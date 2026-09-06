@@ -150,6 +150,76 @@ pub fn count_xff_entries(xff: Option<&str>) -> usize {
     })
 }
 
+/// Classify each `X-Forwarded-For` entry as public or private, in order, and
+/// never record the entry itself.
+///
+/// The count alone cannot separate a spoofable public first entry from a
+/// private one appended by our own fabric, and that single distinction settles
+/// four constants at once: this server's `trusted_proxy_hops`, webmail's depth,
+/// Synapse's `x_forwarded`, and Mastodon's absence. Three of those record
+/// nothing and cannot be checked after the fact.
+///
+/// The output is positional and carries no address: `"private,private"` for a
+/// two-entry chain that never left the fabric. An address in a log is the thing
+/// the rule against logging them exists to keep out, so the classification is
+/// the whole payload.
+///
+/// An entry that does not parse is `unparseable` rather than assumed either
+/// way. Ports (`203.0.113.7:41234`) and obfuscated identifiers land there, and
+/// counting them as public would manufacture the finding this exists to test.
+///
+/// `public` means "not one of the private scopes below", not "routable". A
+/// cross-engine review named the gap: CGNAT (`100.64.0.0/10`) and the
+/// documentation ranges (`192.0.2.0/24`, `2001:db8::/32`) are labelled `public`
+/// and none of them is publicly routable. Those are false positives and they
+/// err in the recoverable direction: one makes somebody look at a chain that
+/// turns out to be fine, where the opposite would hide the exact entry this
+/// exists to catch. Read a `public` as "worth checking", not as "spoofed".
+#[must_use]
+pub fn classify_xff_entries(xff: Option<&str>) -> String {
+    let Some(raw) = xff else {
+        return String::new();
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            // A bracketed v6 literal is legal in this header and does not parse
+            // as an `IpAddr`, so strip the brackets before deciding.
+            let bare = part
+                .strip_prefix('[')
+                .and_then(|r| r.strip_suffix(']'))
+                .unwrap_or(part);
+            match bare.parse::<IpAddr>() {
+                Ok(ip) if is_private_scope(&ip) => "private",
+                Ok(_) => "public",
+                Err(_) => "unparseable",
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Private, loopback, link-local or unspecified, using only stable predicates.
+///
+/// `Ipv4Addr::is_global` and `Ipv6Addr::is_unique_local` are unstable, so the
+/// v6 cases are the prefix tests they would perform: `fc00::/7` for unique-local
+/// and `fe80::/10` for link-local.
+const fn is_private_scope(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+        }
+        IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+        }
+    }
+}
+
 #[must_use]
 pub fn parse_client_ip(xff: Option<&str>, trusted_proxy_hops: usize) -> Option<IpAddr> {
     let raw = xff?;
@@ -172,6 +242,88 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn a_private_chain_classifies_as_private_and_carries_no_address() {
+        let out = classify_xff_entries(Some("10.0.1.5, 192.168.4.9"));
+        assert_eq!(out, "private,private");
+        assert!(
+            !out.contains("10."),
+            "an address reached the log line: {out}"
+        );
+        assert!(
+            !out.contains("192."),
+            "an address reached the log line: {out}"
+        );
+    }
+
+    #[test]
+    fn a_public_first_entry_is_named_public() {
+        // The finding this exists to detect: something outside the fabric put a
+        // routable address at the head of the chain.
+        assert_eq!(
+            classify_xff_entries(Some("203.0.113.7, 10.0.1.5")),
+            "public,private"
+        );
+    }
+
+    #[test]
+    fn position_is_preserved_so_the_two_orders_are_distinguishable() {
+        // Same two scopes, opposite order, each pinned to its exact string.
+        //
+        // Written first as a single `assert_ne!` between the two, which reads
+        // as an order test and is not one: reversing the output reverses both
+        // sides and they stay unequal, so it survived a mutation that reversed
+        // the chain. It pinned only that the function is not set-valued. Which
+        // end is public is the whole question, so both sides are named.
+        assert_eq!(
+            classify_xff_entries(Some("203.0.113.7, 10.0.1.5")),
+            "public,private"
+        );
+        assert_eq!(
+            classify_xff_entries(Some("10.0.1.5, 203.0.113.7")),
+            "private,public"
+        );
+    }
+
+    #[test]
+    fn loopback_link_local_and_unspecified_are_private() {
+        assert_eq!(
+            classify_xff_entries(Some("127.0.0.1, 169.254.1.1, 0.0.0.0")),
+            "private,private,private"
+        );
+    }
+
+    #[test]
+    fn v6_unique_local_and_link_local_are_private_and_a_routable_v6_is_not() {
+        assert_eq!(classify_xff_entries(Some("fd00::1")), "private");
+        assert_eq!(classify_xff_entries(Some("fe80::1")), "private");
+        assert_eq!(classify_xff_entries(Some("[::1]")), "private");
+        // Both conventions on purpose. Documentation ranges are the right test
+        // data and are themselves non-routable, so on their own they assert the
+        // caveat rather than the property; a genuinely routable address of each
+        // family asserts the property.
+        assert_eq!(classify_xff_entries(Some("2001:db8::1")), "public");
+        assert_eq!(classify_xff_entries(Some("2606:4700:4700::1111")), "public");
+        assert_eq!(classify_xff_entries(Some("8.8.8.8")), "public");
+    }
+
+    #[test]
+    fn an_entry_that_does_not_parse_is_unparseable_rather_than_public() {
+        // Counting a port-bearing or obfuscated entry as public would
+        // manufacture the finding this measurement exists to test.
+        assert_eq!(
+            classify_xff_entries(Some("203.0.113.7:41234, _hidden, 10.0.1.5")),
+            "unparseable,unparseable,private"
+        );
+    }
+
+    #[test]
+    fn an_absent_or_empty_header_yields_an_empty_string() {
+        assert_eq!(classify_xff_entries(None), "");
+        assert_eq!(classify_xff_entries(Some("")), "");
+        assert_eq!(classify_xff_entries(Some(" , ")), "");
+    }
 
     #[test]
     fn record_then_get_round_trip() {
